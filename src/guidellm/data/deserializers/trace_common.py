@@ -98,14 +98,41 @@ def create_prompt_from_hash_ids(
     hash_ids: list[int],
     hash_id_table: dict[int, tuple[int, ...]],
     processor: PreTrainedTokenizerBase,
+    hash_id_text: dict[int, str] | None = None,
 ) -> str:
     """Returns a synthetic prompt from `hash_ids` using pre-generated token blocks.
 
-    Precondition: All ids in `hash_ids` appear in `hash_id_table`."""
-    prompt_token_ids = [
-        token for hash_id in hash_ids for token in hash_id_table[hash_id]
-    ]
-    return decode_prompt(processor, prompt_token_ids)
+    When ``hash_id_text`` is provided, each block is decoded to text at most once
+    (cached by hash ID) and the prompt is composed by concatenating the cached
+    block strings. This avoids re-decoding the full token list on every request,
+    which dominates DAG construction on multi-turn traces with heavy prefix reuse.
+    When ``hash_id_text`` is ``None`` the full concatenated token list is decoded
+    in a single call (the original, byte-exact behavior).
+
+    Precondition: All ids in ``hash_ids`` appear in ``hash_id_table``.
+
+    :param hash_ids: Ordered hash IDs for one prompt.
+    :param hash_id_table: Token blocks keyed by hash ID.
+    :param processor: Tokenizer used to decode token blocks to text.
+    :param hash_id_text: Optional decoded-text cache keyed by hash ID, with the
+        same lifetime/scope as ``hash_id_table``. When given, enables per-block
+        decode caching; when ``None``, the full token list is decoded at once.
+    :return: The composed prompt string.
+    """
+    if hash_id_text is None:
+        prompt_token_ids = [
+            token for hash_id in hash_ids for token in hash_id_table[hash_id]
+        ]
+        return decode_prompt(processor, prompt_token_ids)
+
+    parts: list[str] = []
+    for hash_id in hash_ids:
+        text = hash_id_text.get(hash_id)
+        if text is None:
+            text = decode_prompt(processor, list(hash_id_table[hash_id]))
+            hash_id_text[hash_id] = text
+        parts.append(text)
+    return "".join(parts)
 
 
 def create_distinct_token_block(

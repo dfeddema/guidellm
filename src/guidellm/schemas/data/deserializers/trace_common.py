@@ -94,6 +94,21 @@ class TraceDataArgs(DataArgs):
             "interpolate, and values above 1 add a gap."
         ),
     )
+    reuse_decoded_blocks: bool = Field(
+        default=False,
+        description=(
+            "Decode each hash-id token block to text once, cache it, and compose "
+            "each prompt by concatenating the cached block strings, instead of "
+            "re-decoding every request's full concatenated token list. On "
+            "multi-turn traces with heavy prefix reuse (e.g. WEKA Claude Code) "
+            "this decodes only unique blocks rather than total tokens, a large "
+            "speedup to DAG construction. Fidelity is preserved: the same hash-id "
+            "sequence always maps to the same text, and token counts and "
+            "prefix-cache reuse are unchanged. For byte-level BPE tokenizers the "
+            "composed prompt is byte-identical to full-list decoding; other "
+            "tokenizers may differ by a few characters at 64-token block seams."
+        ),
+    )
 
     @model_validator(mode="after")
     def merge_kwargs(self):

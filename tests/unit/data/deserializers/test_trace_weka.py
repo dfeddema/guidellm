@@ -1826,3 +1826,79 @@ class TestWEKATraceFormatArgsTools:
                 source=trace_file_source(tmp_path),
                 tool_response_tokens_stdev=1,
             )
+
+
+def concat_compatible_processor() -> Mock:
+    """Like ``compatible_processor`` but with a concatenating decode.
+
+    ``decode(a + b) == decode(a) + decode(b)`` holds, as it does for real
+    byte-level BPE tokenizers, so the per-block decoded-text cache
+    (``reuse_decoded_blocks``) composes prompts byte-identically to decoding the
+    full token list.
+    """
+    random.seed(0)
+    proc = Mock()
+    proc.encode.side_effect = lambda text: [
+        random.randint(0, 1000) for _ in range(len(text.split()))
+    ]
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: "".join(
+        f"<{t}>" for t in tokens
+    )
+    return proc
+
+
+class TestReuseDecodedBlocks:
+    def _run(self, trace: Path, *, reuse: bool, block_size: int) -> list[str]:
+        config = WEKATraceFormatArgs(
+            source=trace_file_source(trace),
+            hash_id_block_size=block_size,
+            reuse_decoded_blocks=reuse,
+        )
+        ds = TraceDatasetDeserializer()(
+            config=config,
+            processor_factory=concat_compatible_processor,
+            random_seed=42,
+        )
+        return [
+            turn.columns["text_column"][0] for turn in load_graph_turns(next(iter(ds)))
+        ]
+
+    @pytest.mark.regression
+    def test_reuse_matches_default_prompts(self, tmp_path: Path):
+        """Caching decoded blocks yields byte-identical prompts to the default path.
+
+        Uses a concatenating tokenizer (the invariant real byte-level BPE
+        tokenizers satisfy), so per-block decode composition equals full-list
+        decoding.
+
+        ## WRITTEN BY AI ##
+        """
+        block_size = 64
+        n_in = block_size * 2
+        trace = write_trace(
+            tmp_path,
+            generate_weka_trace(
+                1,
+                4,
+                [TraceColumnGenerator("id", lambda i: f'"conv{i}"')],
+                [
+                    TraceColumnGenerator("t", lambda i: i),
+                    TraceColumnGenerator("in", lambda _: n_in),
+                    TraceColumnGenerator("out", lambda _: 5),
+                    TraceColumnGenerator("hash_ids", lambda i: [1, i + 2]),
+                ],
+            ),
+        )
+        default_prompts = self._run(trace, reuse=False, block_size=block_size)
+        cached_prompts = self._run(trace, reuse=True, block_size=block_size)
+        assert cached_prompts == default_prompts
+        assert len(default_prompts) == 4
+
+    @pytest.mark.smoke
+    def test_reuse_flag_defaults_to_false(self, tmp_path: Path):
+        """The optimization is opt-in; the default preserves existing behavior.
+
+        ## WRITTEN BY AI ##
+        """
+        config = WEKATraceFormatArgs(source=trace_file_source(tmp_path))
+        assert config.reuse_decoded_blocks is False
