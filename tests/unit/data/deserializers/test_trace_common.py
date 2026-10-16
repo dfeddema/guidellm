@@ -17,6 +17,7 @@ from guidellm.data.deserializers import (
 from guidellm.data.deserializers.trace_common import (
     TraceDatasetDeserializer,
     TraceFormatRegistry,
+    create_prompt_from_hash_ids,
     decode_prompt,
     generate_token_ids,
 )
@@ -795,3 +796,62 @@ class TestTraceDatasetDeserializer:
             match=r"expected str or Path to a local \.json or \.jsonl file",
         ):
             self.deserialize(deserializer, trace)
+
+
+def concat_processor() -> Mock:
+    """Tokenizer whose decode concatenates per-token pieces with no separator.
+
+    For such a tokenizer ``decode(a + b) == decode(a) + decode(b)``, so the
+    per-block decoded-text cache produces byte-identical prompts to decoding the
+    full token list (the invariant real byte-level BPE tokenizers also satisfy).
+    """
+    proc = Mock()
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: "".join(
+        f"<{t}>" for t in tokens
+    )
+    return proc
+
+
+@pytest.mark.smoke
+def test_create_prompt_from_hash_ids_uncached_decodes_full_list():
+    """Without a text cache, the full concatenated token list is decoded once.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = concat_processor()
+    table = {1: (10, 11), 2: (20,), 3: (30, 31)}
+    result = create_prompt_from_hash_ids([1, 2, 3], table, proc)
+    assert result == "<10><11><20><30><31>"
+    proc.decode.assert_called_once_with([10, 11, 20, 30, 31], skip_special_tokens=True)
+
+
+@pytest.mark.sanity
+def test_create_prompt_from_hash_ids_cached_matches_uncached():
+    """The cached path yields the same prompt as the uncached full-list decode.
+
+    ## WRITTEN BY AI ##
+    """
+    table = {1: (10, 11), 2: (20,), 3: (30, 31), 4: (40,)}
+    requests = [[1, 2], [1, 2, 3], [1, 2, 3, 4], [1, 4]]
+    cache: dict[int, str] = {}
+    for ids in requests:
+        uncached = create_prompt_from_hash_ids(ids, table, concat_processor())
+        cached = create_prompt_from_hash_ids(ids, table, concat_processor(), cache)
+        assert cached == uncached
+
+
+@pytest.mark.sanity
+def test_create_prompt_from_hash_ids_cache_decodes_each_block_once():
+    """Each unique block is decoded at most once; reused blocks hit the cache.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = concat_processor()
+    table = {1: (10,), 2: (20,), 3: (30,)}
+    cache: dict[int, str] = {}
+    create_prompt_from_hash_ids([1, 2], table, proc, cache)
+    create_prompt_from_hash_ids([1, 2, 3], table, proc, cache)
+    create_prompt_from_hash_ids([1, 2, 3], table, proc, cache)
+    # 6 blocks referenced across requests, but only 3 distinct -> 3 decodes.
+    assert proc.decode.call_count == 3
+    assert set(cache) == {1, 2, 3}

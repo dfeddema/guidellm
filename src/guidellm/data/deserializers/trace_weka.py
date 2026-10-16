@@ -274,6 +274,9 @@ class WEKATraceFormat(TraceFormatBase):
 
         self._hash_id_table: dict[int, tuple[int, ...]] = {}
         self._sibling_table: dict[Any, set[tuple[int, ...]]] = {}
+        # Decoded-text cache keyed by hash ID (same lifetime as the token table),
+        # used only when ``config.reuse_decoded_blocks`` is set.
+        self._hash_id_text: dict[int, str] = {}
         # Filled by each ``__iter__`` pass so mixed subagent/API schemas are
         # not forced through a single HuggingFace Arrow table.
         self._conversations: list[tuple[str, list[dict[str, Any]], str | None]] = []
@@ -298,6 +301,7 @@ class WEKATraceFormat(TraceFormatBase):
         """
         self._hash_id_table = {}
         self._sibling_table = {}
+        self._hash_id_text = {}
         self._tool_response_sampler = None
 
     def __iter__(self) -> Iterable[Dataset]:
@@ -382,6 +386,7 @@ class WEKATraceFormat(TraceFormatBase):
         faker: Faker,
         hash_id_table: dict[int, tuple[int, ...]] | None = None,
         sibling_token_blocks: dict[Any, set[tuple[int, ...]]] | None = None,
+        hash_id_text: dict[int, str] | None = None,
     ) -> str:
         """Before generating the prompt, this first generates a block of tokens for
         each hash ID that has not already been seen.
@@ -395,6 +400,11 @@ class WEKATraceFormat(TraceFormatBase):
             current copy's table.
         :param sibling_token_blocks: Distinctness set per previous hash ID, matching
             ``hash_id_table``'s lifetime. Defaults to the current copy's set.
+        :param hash_id_text: Optional decoded-text cache keyed by hash ID, matching
+            ``hash_id_table``'s lifetime. When provided (via
+            ``config.reuse_decoded_blocks``), each block is decoded at most once and
+            prompts are composed from cached strings. When ``None``, the full token
+            list is decoded per request.
         """
         if hash_id_table is None:
             hash_id_table = self._hash_id_table
@@ -414,7 +424,9 @@ class WEKATraceFormat(TraceFormatBase):
             faker,
             lambda _idx, _hash_id: block_size,
         )
-        prompt = create_prompt_from_hash_ids(ids, hash_id_table, processor)
+        prompt = create_prompt_from_hash_ids(
+            ids, hash_id_table, processor, hash_id_text
+        )
         remainder = _generate_remaining_prompt(n_in % block_size, processor, faker)
         if not prompt:
             return remainder
@@ -434,9 +446,15 @@ class WEKATraceFormat(TraceFormatBase):
         if hash_id_scope == "local":
             hash_id_table: dict[int, tuple[int, ...]] = {}
             sibling_token_blocks: dict[Any, set[tuple[int, ...]]] = {}
+            hash_id_text: dict[int, str] | None = (
+                {} if self.config.reuse_decoded_blocks else None
+            )
         else:
             hash_id_table = self._hash_id_table
             sibling_token_blocks = self._sibling_table
+            hash_id_text = (
+                self._hash_id_text if self.config.reuse_decoded_blocks else None
+            )
         specs, _last = self._emit_chain(
             requests,
             agent_id="default",
@@ -461,6 +479,7 @@ class WEKATraceFormat(TraceFormatBase):
                 faker,
                 hash_id_table,
                 sibling_token_blocks,
+                hash_id_text,
             )
             columns: dict[str, Any] = {
                 "text_column": [prompt],
