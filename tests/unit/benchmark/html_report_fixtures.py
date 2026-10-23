@@ -154,6 +154,8 @@ def empty_metrics_base() -> GenerativeMetrics:
         prompt_token_count=zero_dist,
         output_token_count=zero_dist,
         total_token_count=zero_dist,
+        cached_token_count=zero_dist,
+        prefix_cache_hit_rate=zero_dist,
         time_to_first_token_ms=zero_dist,
         time_to_first_output_token_ms=zero_dist,
         time_per_output_token_ms=zero_dist,
@@ -229,6 +231,7 @@ def make_scheduler_metrics(
         resolve_time_avg=0.0,
         finalized_delay_avg=0.0,
         processed_delay_avg=0.0,
+        generation_delay=distribution(0.0),
     )
 
 

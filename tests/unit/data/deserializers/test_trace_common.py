@@ -3,10 +3,10 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
-from datasets import IterableDataset
+from datasets import Dataset, IterableDataset
 from faker import Faker
 from pydantic import ValidationError
 
@@ -16,16 +16,24 @@ from guidellm.data.deserializers import (
 )
 from guidellm.data.deserializers.trace_common import (
     TraceDatasetDeserializer,
+    TraceFormatBase,
     TraceFormatRegistry,
+    create_prompt_from_hash_ids,
     decode_prompt,
     generate_token_ids,
+    tokenizer_supports_block_concat,
 )
+from guidellm.data.deserializers.trace_minimal import MinimalTraceFormat
+from guidellm.data.deserializers.trace_session_timing import TraceSessionTiming
+from guidellm.data.finalizers.generative import GenerativeRequestFinalizer
 from guidellm.data.schemas import InvalidRowError
 from guidellm.data.schemas.conversation_graph_data import (
     ConversationGraphData,
     ConversationTurnData,
 )
+from guidellm.scheduler.schemas.conversation_graph import GenerativeConversationGraph
 from guidellm.schemas.data import FileDataArgs, MinimalTraceFormatArgs, TraceDataArgs
+from guidellm.schemas.data.finalizers import GenerativeRequestFinalizerArgs
 from tests.unit.data.deserializers.trace_test_utils import trace_file_source
 
 
@@ -795,3 +803,186 @@ class TestTraceDatasetDeserializer:
             match=r"expected str or Path to a local \.json or \.jsonl file",
         ):
             self.deserialize(deserializer, trace)
+
+    @pytest.mark.sanity
+    def test_missing_duration_column_warns_once(self, tmp_path: Path, deserializer):
+        """
+        A trace without a duration column logs one warning at load.
+
+        ## WRITTEN BY AI ##
+        """
+        trace = write_trace(
+            tmp_path,
+            '{"timestamp": 1, "input_length": 10, "output_length": 1}\n',
+        )
+        with patch("guidellm.data.deserializers.trace_common.logger") as mock_logger:
+            self.deserialize(deserializer, trace)
+
+        assert mock_logger.warning.call_count == 1
+
+    @pytest.mark.sanity
+    def test_present_duration_column_does_not_warn(self, tmp_path: Path, deserializer):
+        """
+        A trace that includes the duration column does not warn.
+
+        ## WRITTEN BY AI ##
+        """
+        trace = write_trace(
+            tmp_path,
+            '{"timestamp": 1, "input_length": 10, "output_length": 1, '
+            '"duration": 0.5}\n',
+        )
+        with patch("guidellm.data.deserializers.trace_common.logger") as mock_logger:
+            self.deserialize(deserializer, trace)
+
+        mock_logger.warning.assert_not_called()
+
+
+class TestTraceDurationColumn:
+    """Recorded request duration reaches scheduling settings.
+
+    ## WRITTEN BY AI ##
+    """
+
+    @pytest.mark.sanity
+    def test_duration_scales_onto_request_settings(self, tmp_path: Path):
+        """
+        A duration column is stored on RequestSettings after dataset time_scale.
+
+        ## WRITTEN BY AI ##
+        """
+        source = trace_file_source(write_trace(tmp_path, ""))
+        config = MinimalTraceFormatArgs(
+            kind="trace_synthetic",
+            source=source,
+            time_scale=2.0,
+        )
+        dataset = Dataset.from_dict(
+            {
+                "timestamp": [10.0, 15.0],
+                "input_length": [4, 4],
+                "output_length": [1, 1],
+                "duration": [1.0, 0.5],
+            }
+        )
+        trace_format = MinimalTraceFormat(config, dataset)
+        graph = TraceFormatBase.build_conversation_graph(
+            trace_format,
+            dataset,
+            mock_processor(),
+            Faker(),
+        )
+        TraceSessionTiming(time_scale=config.time_scale).apply_scale(graph)
+
+        finalized = GenerativeRequestFinalizer(GenerativeRequestFinalizerArgs())(
+            [{"conversation_turns_column": [graph.model_dump(mode="json")]}]
+        )
+
+        assert isinstance(finalized, GenerativeConversationGraph)
+        assert finalized.nodes["main_0"].settings.trace_duration == pytest.approx(2.0)
+        assert finalized.nodes["main_1"].settings.trace_duration == pytest.approx(1.0)
+        assert finalized.nodes["main_0"].settings.relative_timestamp == pytest.approx(
+            0.0
+        )
+        assert finalized.nodes["main_1"].settings.relative_timestamp == pytest.approx(
+            10.0
+        )
+
+
+def concat_processor() -> Mock:
+    """Tokenizer whose decode concatenates per-token pieces with no separator.
+
+    For such a tokenizer ``decode(a + b) == decode(a) + decode(b)``, so the
+    per-block decoded-text cache produces byte-identical prompts to decoding the
+    full token list (the invariant real byte-level BPE tokenizers also satisfy).
+    """
+    proc = Mock()
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: "".join(
+        f"<{t}>" for t in tokens
+    )
+    return proc
+
+
+@pytest.mark.smoke
+def test_create_prompt_from_hash_ids_uncached_decodes_full_list():
+    """Without a text cache, the full concatenated token list is decoded once.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = concat_processor()
+    table = {1: (10, 11), 2: (20,), 3: (30, 31)}
+    result = create_prompt_from_hash_ids([1, 2, 3], table, proc)
+    assert result == "<10><11><20><30><31>"
+    proc.decode.assert_called_once_with([10, 11, 20, 30, 31], skip_special_tokens=True)
+
+
+@pytest.mark.sanity
+def test_create_prompt_from_hash_ids_cached_matches_uncached():
+    """The cached path yields the same prompt as the uncached full-list decode.
+
+    ## WRITTEN BY AI ##
+    """
+    table = {1: (10, 11), 2: (20,), 3: (30, 31), 4: (40,)}
+    requests = [[1, 2], [1, 2, 3], [1, 2, 3, 4], [1, 4]]
+    cache: dict[int, str] = {}
+    for ids in requests:
+        uncached = create_prompt_from_hash_ids(ids, table, concat_processor())
+        cached = create_prompt_from_hash_ids(ids, table, concat_processor(), cache)
+        assert cached == uncached
+
+
+@pytest.mark.sanity
+def test_create_prompt_from_hash_ids_cache_decodes_each_block_once():
+    """Each unique block is decoded at most once; reused blocks hit the cache.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = concat_processor()
+    table = {1: (10,), 2: (20,), 3: (30,)}
+    cache: dict[int, str] = {}
+    create_prompt_from_hash_ids([1, 2], table, proc, cache)
+    create_prompt_from_hash_ids([1, 2, 3], table, proc, cache)
+    create_prompt_from_hash_ids([1, 2, 3], table, proc, cache)
+    # 6 blocks referenced across requests, but only 3 distinct -> 3 decodes.
+    assert proc.decode.call_count == 3
+    assert set(cache) == {1, 2, 3}
+
+
+@pytest.mark.sanity
+def test_tokenizer_supports_block_concat_true_for_concatenating_decode():
+    """A byte-level-BPE-like tokenizer (self-delimiting, no separator) probes True.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = Mock()
+    proc.encode.side_effect = lambda text: list(range(len(text.split())))
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: "".join(
+        f"<{t}>" for t in tokens
+    )
+    assert tokenizer_supports_block_concat(proc) is True
+
+
+@pytest.mark.sanity
+def test_tokenizer_supports_block_concat_false_for_space_joining_decode():
+    """A tokenizer that re-inserts separators at boundaries probes False.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = Mock()
+    proc.encode.side_effect = lambda text: list(range(len(text.split())))
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: " ".join(
+        f"tok{i}" for i, _ in enumerate(tokens)
+    )
+    assert tokenizer_supports_block_concat(proc) is False
+
+
+@pytest.mark.smoke
+def test_tokenizer_supports_block_concat_false_when_too_few_tokens():
+    """A probe that yields fewer than two tokens cannot be verified, so it is False.
+
+    ## WRITTEN BY AI ##
+    """
+    proc = Mock()
+    proc.encode.side_effect = lambda text: [0]
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: ""
+    assert tokenizer_supports_block_concat(proc) is False

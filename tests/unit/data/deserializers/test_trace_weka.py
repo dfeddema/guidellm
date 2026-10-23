@@ -5,9 +5,11 @@ import random
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
+from logot import Logot
+from logot.logged import debug, warning
 from pydantic import ValidationError
 
 from guidellm.data.deserializers import DatasetDeserializerFactory
@@ -154,6 +156,7 @@ class TestWEKATraceFormat:
                 "tool_response_tokens_stdev",
                 "tool_response_tokens_min",
                 "tool_response_tokens_max",
+                "max_context_len",
             ),
             kwargs,
         )
@@ -596,9 +599,8 @@ class TestWEKATraceFormat:
         assert timestamps2 == pytest.approx([71.0, 71.5])
 
     @pytest.mark.smoke
-    @patch("guidellm.data.deserializers.trace_weka.logger")
     def test_earlier_conversation_warns_and_resets_origin(
-        self, mock_logger, tmp_path: Path, deserializer
+        self, tmp_path: Path, deserializer, logot: Logot
     ):
         """An earlier later-row timestamp warns; already-emitted graphs stay put.
 
@@ -635,11 +637,102 @@ class TestWEKATraceFormat:
         timestamps2 = [turn.columns["relative_timestamp_column"][0] for turn in conv2]
         assert timestamps1 == pytest.approx([0.0, 10.0])
         assert timestamps2 == pytest.approx([0.0, 10.0])
-        messages = [
-            call.args[0].format(*call.args[1:]) if call.args else ""
-            for call in mock_logger.warning.call_args_list
+        logot.assert_logged(
+            warning(
+                "WEKA conversation 'early_second' starts earlier than previously "
+                "seen timestamps; the dataset is not ordered "
+                "chronologically, so relative timestamps of "
+                "conversations will be misaligned"
+            )
+        )
+
+    @pytest.mark.sanity
+    def test_max_context_len_discards_conversation_when_first_turn_exceeds(
+        self, tmp_path: Path, deserializer, logot: Logot
+    ):
+        """
+        Skip a conversation whose first turn already exceeds the token budget.
+
+        ## WRITTEN BY AI ##
+        """
+        trace = write_trace(
+            tmp_path,
+            '{"id": "conv0", "requests": ['
+            '{"t": 0, "in": 30, "out": 30, "hash_ids": []}, '
+            '{"t": 1, "in": 1, "out": 1, "hash_ids": []}]}\n',
+        )
+        ds = self.deserialize(deserializer, trace, max_context_len=50)
+        assert list(ds) == []
+        logot.assert_logged(
+            debug(
+                "WEKA conversation 'conv0' truncated: discarding 2 "
+                "turn(s) starting at node 'main_0' (turn tokens=60, running=0)"
+            )
+        )
+
+    @pytest.mark.sanity
+    def test_max_context_len_truncates_at_overflow_using_trace_origin(
+        self, tmp_path: Path, deserializer, logot: Logot
+    ):
+        """
+        Drop the overflowing turn and later turns. Relative timestamps stay on
+        the dataset origin, which is taken from every request time.
+
+        ## WRITTEN BY AI ##
+        """
+        # Emit order is 100, then 40, then 0. The last turn exceeds the budget
+        # and is dropped, but it still sets the dataset origin to 0.
+        trace = write_trace(
+            tmp_path,
+            '{"id": "conv0", "requests": ['
+            '{"t": 100.0, "in": 10, "out": 10, "hash_ids": []}, '
+            '{"t": 40.0, "in": 10, "out": 5, "hash_ids": []}, '
+            '{"t": 0.0, "in": 100, "out": 100, "hash_ids": []}]}\n',
+        )
+        ds = self.deserialize(deserializer, trace, max_context_len=40)
+        turns = load_graph_turns(next(iter(ds)))
+        assert [turn.node_id for turn in turns] == ["main_0", "main_1"]
+        assert [turn.columns["relative_timestamp_column"][0] for turn in turns] == [
+            100.0,
+            40.0,
         ]
-        assert any("not ordered chronologically" in message for message in messages)
+        logot.assert_logged(
+            debug(
+                "WEKA conversation 'conv0' truncated: discarding 1 "
+                "turn(s) starting at node 'main_2' (turn tokens=200, running=35)"
+            )
+        )
+
+    @pytest.mark.regression
+    def test_max_context_len_unset_keeps_every_turn(
+        self, tmp_path: Path, deserializer, logot: Logot
+    ):
+        """
+        Leave conversations unchanged when no context-length cap is configured.
+
+        ## WRITTEN BY AI ##
+        """
+        trace = write_trace(
+            tmp_path,
+            '{"id": "conv0", "requests": ['
+            '{"t": 100.0, "in": 10, "out": 10, "hash_ids": []}, '
+            '{"t": 40.0, "in": 10, "out": 5, "hash_ids": []}, '
+            '{"t": 0.0, "in": 100, "out": 100, "hash_ids": [1]}]}\n',
+        )
+        ds = self.deserialize(deserializer, trace)
+        turns = load_graph_turns(next(iter(ds)))
+        assert [turn.node_id for turn in turns] == ["main_0", "main_1", "main_2"]
+        assert [turn.columns["relative_timestamp_column"][0] for turn in turns] == [
+            100.0,
+            40.0,
+            0.0,
+        ]
+        logot.assert_not_logged(
+            debug(
+                "WEKA conversation '%s' truncated: discarding %d "
+                "turn(s) starting at node '%s' (turn tokens=%d, running=%d)"
+            )
+        )
 
     @pytest.mark.sanity
     @pytest.mark.parametrize("hash_id_scope", [None, "global"])
@@ -1088,9 +1181,8 @@ class TestWEKATraceFormat:
         ]
 
     @pytest.mark.sanity
-    @patch("guidellm.data.deserializers.trace_weka.logger")
     def test_subagent_without_preceding_parent_is_independent_root(
-        self, mock_logger, tmp_path: Path, deserializer
+        self, tmp_path: Path, deserializer, logot: Logot
     ):
         """A leading subagent is replayed as a root and the next parent joins it.
 
@@ -1123,11 +1215,12 @@ class TestWEKATraceFormat:
             for parent in turns["main_0"].parents
         }
         assert main_parents == {"sa_0_0": "last"}
-        messages = [
-            call.args[0].format(*call.args[1:]) if call.args else ""
-            for call in mock_logger.warning.call_args_list
-        ]
-        assert any("no preceding parent turn" in message for message in messages)
+        logot.assert_logged(
+            warning(
+                "WEKA subagent 'explore' in conversation 'conv0' has no "
+                "preceding parent turn; replaying as an independent root"
+            )
+        )
 
     @pytest.mark.sanity
     def test_inner_timestamps_relative_to_spawn(self, tmp_path: Path, deserializer):
@@ -1228,9 +1321,8 @@ class TestWEKATraceFormat:
         assert len(turns) == 3
 
     @pytest.mark.sanity
-    @patch("guidellm.data.deserializers.trace_weka.logger")
     def test_overlap_warns_on_same_chain(
-        self, mock_logger, tmp_path: Path, deserializer
+        self, tmp_path: Path, deserializer, logot: Logot
     ):
         """Consecutive turns of one agent that overlap in time are logged at debug.
 
@@ -1256,18 +1348,18 @@ class TestWEKATraceFormat:
         )
         ds = self.deserialize(deserializer, trace)
         load_graph_turns(next(iter(ds)))
-        messages = [
-            call.args[0].format(*call.args[1:]) if call.args else ""
-            for call in mock_logger.debug.call_args_list
-        ]
-        assert any("overlapping requests" in message for message in messages)
-        assert any("will run until t=" in message for message in messages)
-        assert any("default" in message for message in messages)
+        logot.assert_logged(
+            debug(
+                "WEKA conversation 'conv0' agent 'default' has overlapping requests: "
+                "the request at t=0.0 will run until t=5.0, which is after "
+                "the next request at t=1.0; they will be serialized on "
+                "this chain"
+            )
+        )
 
     @pytest.mark.sanity
-    @patch("guidellm.data.deserializers.trace_weka.logger")
     def test_overlap_does_not_warn_for_parallel_subagents(
-        self, mock_logger, tmp_path: Path, deserializer
+        self, tmp_path: Path, deserializer, logot: Logot
     ):
         """Parallel subagents may share timestamps without an overlap debug log.
 
@@ -1299,11 +1391,9 @@ class TestWEKATraceFormat:
         )
         ds = self.deserialize(deserializer, trace)
         load_graph_turns(next(iter(ds)))
-        messages = [
-            call.args[0].format(*call.args[1:]) if call.args else ""
-            for call in mock_logger.debug.call_args_list
-        ]
-        assert not any("overlapping requests" in message for message in messages)
+        logot.assert_not_logged(
+            debug("WEKA conversation '%s' agent '%s' has overlapping requests: %s")
+        )
 
     @pytest.mark.smoke
     def test_tool_use_then_tool_result_maps_to_call_and_injection(
@@ -1826,3 +1916,82 @@ class TestWEKATraceFormatArgsTools:
                 source=trace_file_source(tmp_path),
                 tool_response_tokens_stdev=1,
             )
+
+
+def concat_compatible_processor() -> Mock:
+    """Like ``compatible_processor`` but with a concatenating decode.
+
+    ``decode(a + b) == decode(a) + decode(b)`` holds, as it does for real
+    byte-level BPE tokenizers, so the per-block decoded-text cache composes
+    prompts byte-identically to decoding the full token list.
+    """
+    random.seed(0)
+    proc = Mock()
+    proc.encode.side_effect = lambda text: [
+        random.randint(0, 1000) for _ in range(len(text.split()))
+    ]
+    proc.decode.side_effect = lambda tokens, skip_special_tokens=False: "".join(
+        f"<{t}>" for t in tokens
+    )
+    return proc
+
+
+class TestReuseDecodedBlocks:
+    def _run(self, trace: Path, *, block_size: int) -> list[str]:
+        config = WEKATraceFormatArgs(
+            source=trace_file_source(trace),
+            hash_id_block_size=block_size,
+        )
+        ds = TraceDatasetDeserializer()(
+            config=config,
+            processor_factory=concat_compatible_processor,
+            random_seed=42,
+        )
+        return [
+            turn.columns["text_column"][0] for turn in load_graph_turns(next(iter(ds)))
+        ]
+
+    @pytest.mark.regression
+    def test_decoded_blocks_reused_across_turns(self, tmp_path: Path):
+        """Decoded-block reuse is always on and stable across a conversation's turns.
+
+        Every turn shares hash id 1 as its first block, so with a concatenating
+        tokenizer (the invariant real byte-level BPE tokenizers satisfy) all turns'
+        prompts must begin with the same decoded first-block text while differing in
+        their distinct second block. The run is also deterministic. Byte-exact
+        equivalence to full-list decoding is covered by the
+        ``create_prompt_from_hash_ids`` helper tests.
+
+        ## WRITTEN BY AI ##
+        """
+        block_size = 64
+        n_in = block_size * 2
+        trace = write_trace(
+            tmp_path,
+            generate_weka_trace(
+                1,
+                4,
+                [TraceColumnGenerator("id", lambda i: f'"conv{i}"')],
+                [
+                    TraceColumnGenerator("t", lambda i: i),
+                    TraceColumnGenerator("in", lambda _: n_in),
+                    TraceColumnGenerator("out", lambda _: 5),
+                    TraceColumnGenerator("hash_ids", lambda i: [1, i + 2]),
+                ],
+            ),
+        )
+        prompts = self._run(trace, block_size=block_size)
+        assert len(prompts) == 4
+        # Deterministic across runs (stable cache output).
+        assert self._run(trace, block_size=block_size) == prompts
+        # Distinct second blocks -> every turn's prompt is distinct.
+        assert len(set(prompts)) == 4
+        # Shared first block (hash id 1) -> a common non-empty decoded prefix.
+        shared = prompts[0]
+        for prompt in prompts[1:]:
+            limit = min(len(shared), len(prompt))
+            idx = 0
+            while idx < limit and shared[idx] == prompt[idx]:
+                idx += 1
+            shared = shared[:idx]
+        assert shared

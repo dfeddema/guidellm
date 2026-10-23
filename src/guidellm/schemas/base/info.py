@@ -33,6 +33,13 @@ class RequestTimings(StandardBaseDict):
         default=None,
         description="Unix timestamp when request was initially targeted for execution",
     )
+    predecessor_completed: float | None = Field(
+        default=None,
+        description=(
+            "Unix timestamp when the last predecessor finished, excluding think "
+            "time. None when the request has no predecessor."
+        ),
+    )
     queued: float | None = Field(
         default=None,
         description="Unix timestamp when request was placed into processing queue",
@@ -167,6 +174,17 @@ class RequestSettings(StandardBaseDict):
         description=(
             "Delay in seconds before requeueing the conversation. This number is a "
             "lower bound on the delay, subject to scheduling."
+        ),
+    )
+    trace_duration: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Recorded request duration in seconds from the trace, in the same "
+            "units as relative_timestamp after dataset time scaling. None when "
+            "the trace has no duration column. schedule_turn=idle_gap uses this "
+            "to keep the idle gap before the next request; a missing value is "
+            "treated as instantaneous."
         ),
     )
 

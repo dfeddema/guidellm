@@ -51,6 +51,18 @@ These metrics provide a breakdown of the overall request statuses, helping users
 - **Definition**: The number of objective-conforming requests completed per second. Requests that complete but breach an objective count toward request rate and not toward goodput, so goodput is always at or below the request rate.
 - **Use Case**: Separates useful capacity from raw capacity. Past a server's saturation point the request rate can stay flat while goodput falls, because requests still complete but no longer complete quickly enough to be useful.
 
+### Per-Objective SLO Attainment
+
+- **Definition**: Independent attainment for each configured `ttft_ms`, `tpot_ms` or `e2el_ms` objective, reported in `slo_attainment_by_metric`. Each entry contains `conforming_requests`, `determined_requests` and `attainment` (a fraction between 0 and 1, or `null` when its denominator is zero). Thresholds remain in `config.slo`.
+- **Population**: Each objective includes successful requests with its own measurement and all errored requests. Incomplete requests are excluded. A request missing TTFT can still be evaluated against E2EL, so individual objectives can have different denominators. Combined `slo_attainment` continues to require every configured measurement; it is not an average of the individual fractions.
+- **Use Case**: Identifies which latency objective is breached when combined attainment is low. The console displays percentages and counts in a separate table; JSON and CSV retain fractions and counts.
+
+### Output-Token Goodput
+
+- **Definition**: `output_token_goodput` is the distribution of output tokens per second from successful requests meeting **every** configured latency objective. It uses the same token-event accounting and measurement window as `output_tokens_per_second`, excluding token events outside that window. Its `successful.mean` is the average conforming output-token rate.
+- **Availability**: The metric is `null` when no objectives are configured or no request can be evaluated against all objectives. A measured population with no conforming requests reports zero. When output usage counts are unavailable, it uses the same streaming-iteration fallback as `output_tokens_per_second`.
+- **Use Case**: Compares useful token throughput across workloads with different output lengths, including speculative decoding benchmarks where one streaming iteration may contain multiple tokens.
+
 ### Output Tokens Per Second
 
 - **Definition**: The average number of output tokens generated per second as a throughput metric across all requests.
@@ -66,17 +78,32 @@ These metrics provide a breakdown of the overall request statuses, helping users
 - **Definition**: The time taken to process a single request, from start to finish.
 - **Use Case**: A critical metric for evaluating the responsiveness of the system.
 
+### Generation Delay
+
+- **Definition**: `generation_delay` is the time between the scheduler beginning to produce the next conversation from `requests_generator` and creating that conversation's request infos. It is recorded once per conversation on scheduler state, not on individual requests.
+- **Use Case**: Shows how long the load generator spends materializing and enqueueing each conversation (dataset iteration plus coordinator prep). A delay near zero means request production is keeping up; a large delay means the dataset or enqueue path is the bottleneck, independent of backend latency and dispatch scheduling.
+
 ### Dispatch Delay
 
 - **Definition**: `request_dispatch_delay` is `request_start - targeted_start`: the time between when a request was scheduled to arrive and when it was actually sent.
-- **Use Case**: Reveals whether the benchmark itself kept up with the configured arrival schedule. A request cannot be dispatched while the concurrency limit is saturated, and that wait is not part of Request Latency. A delay near zero means the reported latencies reflect the full picture; a large delay means the load generator fell behind and the server saw a lower arrival rate than was requested.
+- **Use Case**: Reveals whether the benchmark itself kept up with the configured arrival schedule. A request cannot be dispatched while the concurrency limit is saturated, and that wait is not part of Request Latency. A delay near zero means the reported latencies reflect the full picture; a large delay means the load generator fell behind and the server saw a lower arrival rate than was requested. Dispatch Delay does not say why the request was late. Turn Predecessor Delay and Turn Scheduling Delay split that wait.
+
+### Turn Predecessor Delay
+
+- **Definition**: `turn_predecessor_delay` is the part of Dispatch Delay spent waiting because a prior turn was still running after this request's targeted start. It is zero when the request has no predecessor, or the predecessor finished before the target. When both happen, the wait until the predecessor finishes is Turn Predecessor Delay and any further wait is Turn Scheduling Delay. The two sum to Dispatch Delay.
+- **Use Case**: Shows that the previous turn, not the load generator, kept this request from starting on time.
+
+### Turn Scheduling Delay
+
+- **Definition**: `turn_scheduling_delay` is Dispatch Delay minus Turn Predecessor Delay. It is the wait after the request was both due and no longer blocked by a predecessor, including time to deserialize the trace, time spent queued, and worker turnaround. Think time (`requeue_delay`) that runs past the target is included here. Trace replay does not set think time.
+- **Use Case**: Can indicate when GuideLLM could not keep up or the machine was undersized for the benchmark.
 
 ### Scheduled Latency
 
 - **Definition**: `request_scheduled_latency` is `request_end - targeted_start`: request latency measured from the scheduled arrival time rather than from dispatch. When all three timestamps are present it equals Dispatch Delay plus Request Latency.
 - **Use Case**: Describes what a client holding to the configured arrival schedule would have experienced, including time spent waiting to be dispatched. When the benchmark keeps up this matches Request Latency; when it falls behind, the gap between the two is latency that Request Latency alone does not show.
 
-Dispatch Delay and Scheduled Latency only apply to some of the scheduling strategies. See [Applicability of Dispatch Delay and Scheduled Latency](#applicability-of-dispatch-delay-and-scheduled-latency) below.
+Dispatch Delay, Turn Predecessor Delay, Turn Scheduling Delay, and Scheduled Latency only apply to some of the scheduling strategies. See [Applicability of Dispatch Delay and Scheduled Latency](#applicability-of-dispatch-delay-and-scheduled-latency) below. In relative trace replay, `targeted_start` moves with the prior turn, so these delays are measured against that shifted target rather than the original trace clock.
 
 ### Time to First Token (TTFT)
 
@@ -102,6 +129,11 @@ Dispatch Delay and Scheduled Latency only apply to some of the scheduling strate
 
 - **Definition**: For the WebSocket backend, the mean of received-token timestamps minus the mean of sent-packet timestamps.
 - **Use Case**: Estimates the average send-to-receive lag across a request. It is approximate, since it assumes sent packets and received tokens line up evenly in time.
+
+### Collector Metrics
+
+- **Definition**: Data gathered from outside GuideLLM while each benchmark runs, such as queued requests, KV cache usage and server-measured latencies scraped from a server's Prometheus endpoint. They are only collected when `--collector` is set.
+- **Use Case**: Adds context from outside GuideLLM that helps explain the benchmark results but isn't produced by the benchmark itself. For example, the `prometheus` collector can show whether latency rose because requests were queuing or the KV cache was full. See the [Collectors Guide](collectors.md).
 
 ## Measurement Window, Warmup, and Cooldown
 
@@ -151,6 +183,36 @@ GuideLLM calculates a comprehensive set of percentiles for each metric, includin
 - **99th Percentile (p99)**: The value below which 99% of the data falls.
 - **99.9th Percentile (p999)**: The value below which 99.9% of the data falls.
 
+### Confidence Intervals
+
+Each summary statistic above is an estimate made from a finite number of requests, and GuideLLM reports how precisely each one was measured alongside the value itself.
+
+- **`mean_ci`**: A two-sided confidence interval for the mean.
+- **`percentile_cis`**: A confidence interval for each reported percentile, or `null` where the run is too short to place one.
+
+Set the level with `--metrics kind=generative,confidence=0.95`. It defaults to 0.95, and `null` reports the metrics without intervals. The level is recorded once per benchmark as `config.confidence`.
+
+The console shows the mean and the half-width of its interval together, for example `80.5 ± 3.9`, and marks a percentile the sample cannot bound with `*`. The CSV appends a `Mean CI` and a `Percentile CIs` column for each metric that carries intervals, the latter keyed by percentile, plus the confidence level. Those columns go at the end of each row so that existing column positions are unchanged.
+
+#### Which metrics report intervals
+
+Intervals are reported only for metrics recorded exactly once per request, where each value is one observation: request latency, TTFT, time to first output token, the round-trip metrics, the token counts, streaming iteration count, dispatch delay, and scheduled latency.
+
+Two groups are reported without intervals:
+
+- **Inter-token latency and time per output token.** Their reported mean is weighted by output tokens, so it is a ratio of total generation time to total tokens rather than a mean over interchangeable observations. Note that their `count` is the summed token exposure, not the number of requests.
+- **Rate distributions**, such as requests per second and output tokens per second. These are derived from event timings rather than per-request observations.
+
+#### Why a percentile interval can be absent
+
+The reported percentiles are order statistics: `p99` is the value at rank `ceil(0.99n)` in the sorted sample. A two-sided interval needs observations on both sides of that rank, which requires at least `ceil(log(alpha / 2) / log(q))` requests. At the default 0.95 confidence that is 72 requests for p95, 368 for p99 and 3688 for p999.
+
+Below those sizes the interval is reported as `null`. This is worth noticing: with fewer than 100 successful requests, the reported `p99` is the single slowest request in the run, and with fewer than 1000 the reported `p999` is as well.
+
+#### What the interval does and does not say
+
+The interval describes how precisely this run measured its own conditions, treating the requests within it as independent observations. It does not describe how far the value would move if the same benchmark were run again. Those two differ when successive requests share a condition that varies between runs, such as the server's load during generation, so a run-to-run comparison needs repeated runs rather than a single run's interval.
+
 ### Use Cases for Statistical Summaries
 
 - **Mean and Median**: Provide a central tendency of the metric values.
@@ -162,7 +224,7 @@ By combining these metrics and statistical summaries, GuideLLM enables users to 
 
 ## Applicability of Dispatch Delay and Scheduled Latency
 
-Both metrics are derived from `targeted_start`, so they only describe arrival-schedule delay for strategies that define an arrival schedule:
+Dispatch Delay, Turn Predecessor Delay, Turn Scheduling Delay, and Scheduled Latency are derived from `targeted_start`, so they only describe arrival-schedule delay for strategies that define an arrival schedule:
 
 - `constant` and `poisson` derive each target from the configured rate.
 - `trace` derives each target from the replayed dataset timestamps. Trace requests that carry no relative timestamp fall back to the benchmark start time and take on the `throughput` caveat below.
@@ -172,8 +234,8 @@ The `synchronous`, `concurrent`, and `throughput` strategies set an ASAP-style t
 - `synchronous` and `concurrent` target the previous request's completion, apart from the requests staggered across a configured rampup. The target is therefore derived from the system's own responses, so a delay measured against it is circular: it describes harness turnaround rather than lag against an arrival schedule.
 - `throughput` targets the benchmark start time for every request, so the value grows with elapsed run time and is not a delay at all.
 
-For those three strategies **both metrics are reported as `null`** rather than as zero, and their columns do not appear in the CSV. Reporting zero would read as "no delay measured", which is a stronger and more misleading claim than "not applicable". This matters for the default `sweep` profile, which runs `synchronous` and `throughput` alongside its rate-based strategies.
+For those three strategies **these metrics are reported as `null`** rather than as zero, and their columns do not appear in the CSV. Reporting zero would read as "no delay measured", which is a stronger and more misleading claim than "not applicable". This matters for the default `sweep` profile, which runs `synchronous` and `throughput` alongside its rate-based strategies.
 
-For multi-turn conversation datasets, a turn's target is fixed when a scheduler slot opens rather than when the preceding turn completes, so configured think time between turns is counted as Dispatch Delay.
+For multi-turn conversation datasets, a turn's target is fixed when a scheduler slot opens rather than when the preceding turn completes, so configured think time between turns is counted as Dispatch Delay and as Turn Scheduling Delay.
 
 Where the metrics do apply they are recorded in the serialized report and the CSV output for offline analysis. They are omitted from the final console latency table in all cases, since that table is shared across every profile in a run.

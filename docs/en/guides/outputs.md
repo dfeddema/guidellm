@@ -97,8 +97,9 @@ Use `sample_size` to set the maximum number of requests **per status group** (co
 | `0`               | Strip all request data (stats only)                        |
 | `N` (e.g. `100`)  | Retain full data for N randomly sampled requests per group |
 
+To retain full request data for at most 100 randomly sampled requests per status group, use:
+
 ```bash
-# Keep full data for only 100 sampled requests per group
 guidellm run \
   --backend kind=openai_http,target=http://localhost:8000 \
   --profile kind=sweep \
@@ -123,7 +124,7 @@ report = GenerativeBenchmarksReport.load_file(
 benchmarks = report.benchmarks
 
 for benchmark in benchmarks:
-    print(benchmark.id_)
+    print(benchmark.config.id_)
 ```
 
-For more details on the `GenerativeBenchmarksReport` class and its methods, refer to the [source code](https://github.com/vllm-project/guidellm/blob/main/src/guidellm/benchmark/schemas/generative/report.py).
+For more details on the `GenerativeBenchmarksReport` class and its methods, refer to the [source code](https://github.com/vllm-project/guidellm/blob/main/src/guidellm/benchmark/schemas/report.py).
