@@ -11,6 +11,7 @@ validation, data preprocessing, profile constraints, and output format specifica
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -24,6 +25,8 @@ from guidellm.benchmark.outputs import (
 from guidellm.benchmark.profiles import Profile, ProfileFactory
 from guidellm.benchmark.progress import (
     BenchmarkerProgress,
+    CompositeBenchmarkerProgress,
+    GenerativeConsoleBenchmarkerProgress,
     GenerativeLoggingBenchmarkerProgress,
 )
 from guidellm.benchmark.schemas import (
@@ -31,6 +34,7 @@ from guidellm.benchmark.schemas import (
     GenerativeBenchmarkAccumulator,
     GenerativeBenchmarksReport,
 )
+from guidellm.collectors import CollectorProcess
 from guidellm.data import (
     DataLoader,
     create_data_loader,
@@ -49,6 +53,7 @@ from guidellm.schemas.benchmark import (
     BenchmarkArgs,
     BenchmarkOutputArgs,
     BenchmarkScenario,
+    CollectorArgs,
     GenerativeMetricsArgs,
     ProfileArgs,
 )
@@ -306,6 +311,38 @@ async def resolve_profile(
     return profile
 
 
+async def resolve_collectors(
+    collectors: list[CollectorArgs],
+    console: Console | None = None,
+) -> CollectorProcess | None:
+    """
+    Start a collector process for the configured collectors.
+
+    :param collectors: Arguments for each collector, in configuration order
+    :param console: Console instance for progress reporting, or None
+    :return: The started collector process, or None without any collectors
+    :raises RuntimeError: If a collector cannot be created
+    """
+    if not collectors:
+        return None
+
+    console_step = (
+        console.print_update_step(title="Starting collectors") if console else None
+    )
+
+    process = CollectorProcess(collectors)
+    await process.start()
+
+    if console_step:
+        console_step.finish(
+            title="Collectors started",
+            details=[collector.model_dump(mode="json") for collector in collectors],
+            status_level="success",
+        )
+
+    return process
+
+
 async def resolve_output_formats(
     outputs: list[BenchmarkOutputArgs],
     console: Console | None = None,
@@ -393,9 +430,6 @@ def resolve_to_single_benchmark(benchmarks: list[BenchmarkArgs]) -> BenchmarkArg
     :return: A single, merged ``BenchmarkArgs`` ready for execution
     :raises NotImplementedError: If any non-mergeable field differs across benchmarks
     """
-    if len(benchmarks) == 1:
-        return benchmarks[0]
-
     # Use this for determining correct field kinds
     # `kind` should not chnage between benchmarks
     base = benchmarks[0]
@@ -422,6 +456,18 @@ def resolve_to_single_benchmark(benchmarks: list[BenchmarkArgs]) -> BenchmarkArg
         for bench in benchmarks:
             val = bench.profile.__dict__[rate_field]
             if isinstance(val, list | tuple):
+                if len(val) > 1:
+                    warnings.warn(
+                        (
+                            "One or more sub-benchmarks specified a list of"
+                            " profile.{0}. This pattern is deprecated and will be"
+                            " removed in a future release. Please use `--override"
+                            " profile.{0} {1}` on the CLI or sub-benchmarks in the"
+                            " config file instead."
+                        ).format(rate_field, ",".join(str(v) for v in val)),
+                        category=FutureWarning,
+                        stacklevel=2,
+                    )
                 merged_rates.extend(val)
             else:
                 merged_rates.append(val)
@@ -455,6 +501,18 @@ def resolve_to_single_benchmark(benchmarks: list[BenchmarkArgs]) -> BenchmarkArg
         for constraint in constraints_at_idx:
             val = constraint.__dict__[list_field]
             if isinstance(val, list | tuple):
+                if len(val) > 1:
+                    warnings.warn(
+                        (
+                            "One or more sub-benchmarks specified a list of"
+                            " constraints[{0}].{1}. This pattern is deprecated and will"
+                            " be removed in a future release. Please use `--override"
+                            " constraints[{0}].{1} {2}` on the CLI or sub-benchmarks in"
+                            " the config file instead."
+                        ).format(idx, list_field, ",".join(str(v) for v in val)),
+                        category=FutureWarning,
+                        stacklevel=2,
+                    )
                 merged_values.extend(val)
             else:
                 merged_values.append(val)
@@ -472,10 +530,9 @@ def resolve_to_single_benchmark(benchmarks: list[BenchmarkArgs]) -> BenchmarkArg
 # Main Entrypoints Functions
 
 
-async def benchmark_generative_text(
+async def benchmark_generative_text(  # noqa: C901
     args: BenchmarkScenario,
-    progress: BenchmarkerProgress[GenerativeBenchmarkAccumulator, GenerativeBenchmark]
-    | None = None,
+    progress: bool = True,
     console: Console | None = None,
     **constraints: str | ConstraintInitializer | Any,
 ) -> tuple[GenerativeBenchmarksReport, list[tuple[str, Any]]]:
@@ -488,12 +545,18 @@ async def benchmark_generative_text(
     initialization, data loading, profile configuration, and output generation.
 
     :param args: Scenario configuration for the benchmark execution
-    :param progress: Optional display tracker; progress is always logged at INFO
-    :param console: Optional console for status reporting, independent of logging
+    :param progress: Progress tracker for benchmark execution, or None for no tracking
+    :param console: Console instance for status reporting, or None for silent operation
     :param constraints: Additional constraint initializers for benchmark limits
     :return: Tuple of GenerativeBenchmarksReport and dictionary of output format
         results
     """
+    trackers: list[
+        BenchmarkerProgress[GenerativeBenchmarkAccumulator, GenerativeBenchmark]
+    ] = [GenerativeLoggingBenchmarkerProgress()]
+    if progress:
+        trackers.append(GenerativeConsoleBenchmarkerProgress())
+
     benchmark_args = resolve_to_single_benchmark(args.get_benchmarks())
 
     metrics_args = benchmark_args.metrics
@@ -540,28 +603,37 @@ async def benchmark_generative_text(
         )
         console.print("\n\n")
 
+    collectors = await resolve_collectors(
+        collectors=benchmark_args.collectors, console=console
+    )
+
     benchmarker: Benchmarker[
         GenerativeBenchmark, GenerationRequest, GenerationResponse
     ] = Benchmarker()
-    async for benchmark in benchmarker.run(
-        accumulator_class=GenerativeBenchmarkAccumulator,
-        benchmark_class=GenerativeBenchmark,
-        requests=request_loader,  # type: ignore[arg-type]
-        backend=backend,
-        profile=profile,
-        environment=NonDistributedEnvironment(),
-        progress=[
-            GenerativeLoggingBenchmarkerProgress(),
-            *([progress] if progress else []),
-        ],
-        sample_size=metrics_args.sample_size,
-        warmup=warmup,
-        cooldown=cooldown,
-        prefer_response_metrics=metrics_args.prefer_response_metrics,
-        slo=metrics_args.slo,
-    ):
-        if benchmark:
-            report.benchmarks.append(benchmark)
+    try:
+        async for benchmark in benchmarker.run(
+            accumulator_class=GenerativeBenchmarkAccumulator,
+            benchmark_class=GenerativeBenchmark,
+            requests=request_loader,  # type: ignore[arg-type]
+            backend=backend,
+            profile=profile,
+            environment=NonDistributedEnvironment(),
+            progress=CompositeBenchmarkerProgress(trackers),
+            sample_size=metrics_args.sample_size,
+            warmup=warmup,
+            cooldown=cooldown,
+            prefer_response_metrics=metrics_args.prefer_response_metrics,
+            slo=metrics_args.slo,
+            confidence=metrics_args.confidence,
+            warnings=metrics_args.warnings,
+            collectors=collectors,
+        ):
+            # Completed benchmark
+            if benchmark:
+                report.benchmarks.append(benchmark)
+    finally:
+        if collectors:
+            await collectors.shutdown()
 
     # Read after the final strategy so the conclusion reflects every benchmark,
     # including the last, whose config was captured before it ran.

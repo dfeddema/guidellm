@@ -8,7 +8,7 @@ Thank you for your interest in contributing to GuideLLM! This document provides 
 
 Before you begin, ensure you have the following installed:
 
-- Python 3.10 or higher
+- Python 3.11 or higher
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) (recommended), pip, or another python package manager
 - Git
 
@@ -105,9 +105,9 @@ Assisted-by: GitHub Copilot gpt-4o
 
 Shared [Agent Skills](https://agentskills.io/specification) live under `.agents/skills/` (the cross-client convention). Cursor loads that path natively; Claude Code follows the tracked `.claude/skills` symlink to the same directory.
 
-| Skill                                                                        | Purpose                                                                                                                                                         |
-| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`guidellm-weekly-summary`](.agents/skills/guidellm-weekly-summary/SKILL.md) | Generate an externally shareable nested-list summary of GuideLLM GitHub activity for the past week (`scripts/fetch_activity.sh` gathers PR/issue JSON via `gh`) |
+| Skill                     | Purpose                                                                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `guidellm-weekly-summary` | Generate an externally shareable nested-list summary of GuideLLM GitHub activity for the past week (`scripts/fetch_activity.sh` gathers PR/issue JSON via `gh`) |
 
 Ask for a weekly summary, team activity update, or status digest of GuideLLM to invoke it. Requires the `gh` CLI authenticated for `vllm-project/guidellm`.
 

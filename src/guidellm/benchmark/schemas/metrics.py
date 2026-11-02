@@ -13,15 +13,18 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, computed_field
 
 from guidellm.benchmark.schemas.accumulator import (
     GenerativeBenchmarkAccumulator,
 )
 from guidellm.scheduler import SchedulerState
 from guidellm.schemas import (
+    DistributionSummary,
     GenerativeRequestStats,
+    SampleUncertainty,
     StandardBaseDict,
+    StandardBaseModel,
     StatusBreakdown,
     StatusDistributionSummary,
 )
@@ -34,7 +37,9 @@ __all__ = [
     "GenerativeMetricsSummary",
     "GenerativeTextMetricsSummary",
     "GenerativeToolCallMetricsSummary",
+    "GenerativeTurnMetrics",
     "GenerativeVideoMetricsSummary",
+    "SLOAttainmentSummary",
     "SchedulerMetrics",
     "StatusTypes",
     "TimedMetricTypeAlias",
@@ -89,6 +94,13 @@ class SchedulerMetrics(StandardBaseDict):
     )
 
     # Scheduler internal performance timings
+    generation_delay: DistributionSummary = Field(
+        default_factory=lambda: DistributionSummary.from_values([]),
+        description=(
+            "Distribution of time between attempting to yield a conversation "
+            "from the request generator and actually yielding it (seconds)"
+        ),
+    )
     queued_time_avg: float = Field(
         description="Avg time requests spent in the queue (seconds)"
     )
@@ -117,6 +129,17 @@ class SchedulerMetrics(StandardBaseDict):
     processed_delay_avg: float = Field(
         description="Avg delay from finalization to processing completion (seconds)"
     )
+    dataset_incomplete: bool = Field(
+        default=False,
+        description=(
+            "True when the request iterator stopped before it was exhausted. "
+            "False when the scheduler registered requests_exhausted"
+        ),
+    )
+    strategy_type: str = Field(
+        default="",
+        description="Type identifier of the strategy that ran this benchmark",
+    )
 
     @classmethod
     def compile(
@@ -142,6 +165,9 @@ class SchedulerMetrics(StandardBaseDict):
             # Request details tracked by the scheduler
             requests_made=accumulator.scheduler_metrics.requests_made,
             # Scheduler internal performance timings
+            generation_delay=DistributionSummary.from_values(
+                scheduler_state.generation_delay_samples
+            ),
             queued_time_avg=accumulator.scheduler_metrics.queued_time.mean or -1.0,
             resolve_start_delay_avg=(
                 accumulator.scheduler_metrics.resolve_start_delay.mean or -1.0
@@ -166,6 +192,10 @@ class SchedulerMetrics(StandardBaseDict):
             processed_delay_avg=(
                 accumulator.scheduler_metrics.processed_delay.mean or -1.0
             ),
+            dataset_incomplete=(
+                "requests_exhausted" not in scheduler_state.scheduler_constraints
+            ),
+            strategy_type=accumulator.config.strategy.type_,
         )
 
 
@@ -296,10 +326,12 @@ class GenerativeMetricsSummary(StandardBaseDict):
                 status: [
                     (  # type: ignore[misc]
                         metric[_TIMED_METRIC_END_TIME_INDEX],
-                        float(metric[value_index] or 0.0),
+                        float(val),
                     )
                     for metric in metrics
                     if metric is not None
+                    for val in [metric[value_index]]
+                    if val is not None
                 ]
                 for status, metrics in metrics_by_status.items()
             }
@@ -314,10 +346,12 @@ class GenerativeMetricsSummary(StandardBaseDict):
                     (  # type: ignore[misc]
                         metric[_TIMED_METRIC_START_TIME_INDEX],
                         metric[_TIMED_METRIC_END_TIME_INDEX],
-                        float(metric[value_index] or 0.0),
+                        float(val),
                     )
                     for metric in metrics
                     if metric is not None
+                    for val in [metric[value_index]]
+                    if val is not None
                 ]
                 for status, metrics in metrics_by_status.items()
             }
@@ -761,6 +795,238 @@ class GenerativeToolCallMetricsSummary(StandardBaseDict):
         )
 
 
+class GenerativeTurnMetrics(StandardBaseDict):
+    """
+    Request timing and size distributions for one turn position.
+
+    In a multi-turn workload the same metric behaves differently at different
+    positions in a conversation: later turns carry more history, so their
+    prompts are longer and their first-token latency depends on how much of
+    that history the server can reuse from its prefix cache. Aggregating all
+    turns into one distribution hides that trend. Each instance holds the
+    distributions for the requests at a single ``turn_index``.
+    """
+
+    turn_index: int = Field(
+        description="Turn position these distributions cover, starting at 0"
+    )
+    request_totals: StatusBreakdown[int, int, int, int] = Field(
+        description=(
+            "Request counts at this turn position by status: successful, "
+            "incomplete, errored, total"
+        )
+    )
+    request_latency: StatusDistributionSummary = Field(
+        description="Distribution of request latencies at this turn position"
+    )
+    prompt_token_count: StatusDistributionSummary = Field(
+        description="Distribution of prompt token counts at this turn position"
+    )
+    time_to_first_token_ms: StatusDistributionSummary = Field(
+        description="Distribution of first token latencies at this turn position"
+    )
+    inter_token_latency_ms: StatusDistributionSummary = Field(
+        description="Distribution of inter-token latencies at this turn position"
+    )
+    cached_token_count: StatusDistributionSummary = Field(
+        description=(
+            "Distribution of prompt token counts served from the prefix cache at "
+            "this turn position"
+        )
+    )
+    prefix_cache_hit_rate: StatusDistributionSummary = Field(
+        description=(
+            "Distribution of the share of each request's prompt tokens served from "
+            "the prefix cache at this turn position"
+        )
+    )
+
+    @classmethod
+    def compile_by_turn(
+        cls,
+        requests: tuple[
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+        ],
+        first_token_requests: tuple[
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+        ],
+        after_first_token_requests: tuple[
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+        ],
+    ) -> list[GenerativeTurnMetrics] | None:
+        """
+        Compile per-turn distributions, or None for a single-turn workload.
+
+        Each argument is a (successful, incomplete, errored) triple already
+        filtered to the measurement window the same way as the corresponding
+        aggregate metric, so a turn's distributions partition the aggregate
+        ones exactly.
+
+        :param requests: Requests within the measurement window, used for
+            latency, counts and prompt sizes
+        :param first_token_requests: Requests whose first token arrived within
+            the measurement window, used for time to first token
+        :param after_first_token_requests: Requests whose decoding started
+            within the measurement window, used for inter-token latency
+        :return: One entry per observed turn index in ascending order, or None
+            when every request is at turn 0, where a per-turn breakdown would
+            only repeat the aggregate metrics
+        """
+        # The windowed groups are normally subsets of ``requests``, but a
+        # request without a start time is treated as instantaneous at a
+        # different event in each group, so it can appear in one and not the
+        # others. Collect indices from every group so no distribution is lost.
+        turn_indices = sorted(
+            {
+                req.info.turn_index
+                for groups in (
+                    requests,
+                    first_token_requests,
+                    after_first_token_requests,
+                )
+                for group in groups
+                for req in group
+            }
+        )
+        if not turn_indices or turn_indices == [0]:
+            return None
+
+        def at_turn(
+            groups: tuple[
+                list[GenerativeRequestStats],
+                list[GenerativeRequestStats],
+                list[GenerativeRequestStats],
+            ],
+            turn_index: int,
+        ) -> tuple[
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+            list[GenerativeRequestStats],
+        ]:
+            successful, incomplete, errored = (
+                [req for req in group if req.info.turn_index == turn_index]
+                for group in groups
+            )
+            return successful, incomplete, errored
+
+        turns: list[GenerativeTurnMetrics] = []
+        for turn_index in turn_indices:
+            successful, incomplete, errored = at_turn(requests, turn_index)
+            ttft_successful, ttft_incomplete, ttft_errored = at_turn(
+                first_token_requests, turn_index
+            )
+            itl_successful, itl_incomplete, itl_errored = at_turn(
+                after_first_token_requests, turn_index
+            )
+            turns.append(
+                cls(
+                    turn_index=turn_index,
+                    request_totals=StatusBreakdown(
+                        successful=len(successful),
+                        incomplete=len(incomplete),
+                        errored=len(errored),
+                        total=len(successful) + len(incomplete) + len(errored),
+                    ),
+                    request_latency=StatusDistributionSummary.from_values_function(
+                        function=lambda req: req.request_latency or 0.0,
+                        successful=successful,
+                        incomplete=incomplete,
+                        errored=errored,
+                    ),
+                    prompt_token_count=StatusDistributionSummary.from_values_function(
+                        function=lambda req: req.prompt_tokens or 0.0,
+                        successful=successful,
+                        incomplete=incomplete,
+                        errored=errored,
+                    ),
+                    time_to_first_token_ms=StatusDistributionSummary.from_values_function(
+                        function=lambda req: req.time_to_first_token_ms or 0.0,
+                        successful=ttft_successful,
+                        incomplete=ttft_incomplete,
+                        errored=ttft_errored,
+                    ),
+                    inter_token_latency_ms=StatusDistributionSummary.from_values_function(
+                        function=lambda req: (
+                            req.inter_token_latency_ms or 0.0,
+                            (req.output_tokens or 1.0) - 1.0,
+                        ),
+                        successful=itl_successful,
+                        incomplete=itl_incomplete,
+                        errored=itl_errored,
+                    ),
+                    cached_token_count=StatusDistributionSummary.from_values_function(
+                        function=lambda req: req.cached_tokens,
+                        successful=successful,
+                        incomplete=incomplete,
+                        errored=errored,
+                    ),
+                    prefix_cache_hit_rate=StatusDistributionSummary.from_values_function(
+                        function=lambda req: req.prefix_cache_hit_rate,
+                        successful=successful,
+                        incomplete=incomplete,
+                        errored=errored,
+                    ),
+                )
+            )
+
+        return turns
+
+
+def root_dispatch_delay_distribution(
+    requests: list[GenerativeRequestStats],
+) -> DistributionSummary | None:
+    """
+    Dispatch delay for the first request of each conversation.
+
+    First turns are requests with ``preceding_nodes == 0``. Later turns are
+    omitted because a slow early turn moves them. ``turn_index`` is not used:
+    with some history modes every turn stays at index 0. A request with no
+    dispatch delay, which is the case when the profile has no arrival
+    schedule, is omitted.
+
+    :param requests: In-window requests, across every status
+    :return: The first-turn delays, or None when none of them have a dispatch delay
+    """
+    delays = [
+        delay
+        for request in requests
+        if request.info.preceding_nodes == 0
+        and (delay := request.request_dispatch_delay) is not None
+    ]
+    if not delays:
+        return None
+    return DistributionSummary.from_values(delays)
+
+
+class SLOAttainmentSummary(StandardBaseModel):
+    """Counts and attainment for one configured latency objective."""
+
+    conforming_requests: int = Field(
+        default=0, ge=0, description="Successful requests satisfying this objective"
+    )
+    determined_requests: int = Field(
+        default=0,
+        ge=0,
+        description="Successful requests with a measurement, plus errored requests",
+    )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def attainment(self) -> float | None:
+        """
+        :return: Conforming fraction, or None when no request can be evaluated
+        """
+        if not self.determined_requests:
+            return None
+        return self.conforming_requests / self.determined_requests
+
+
 class GenerativeMetrics(StandardBaseDict):
     """
     Comprehensive metrics for generative AI benchmarks.
@@ -803,6 +1069,30 @@ class GenerativeMetrics(StandardBaseDict):
             "schedule"
         ),
     )
+    turn_predecessor_delay: StatusDistributionSummary | None = Field(
+        default=None,
+        description=(
+            "Portion of dispatch delay spent waiting on a predecessor that "
+            "was still running past the targeted start. Zero for requests "
+            "with no predecessor. None when the strategy does not define an "
+            "arrival schedule"
+        ),
+    )
+    turn_scheduling_delay: StatusDistributionSummary | None = Field(
+        default=None,
+        description=(
+            "Portion of dispatch delay after the predecessor had finished, "
+            "including deserializer, queue, and worker lag. None when the "
+            "strategy does not define an arrival schedule"
+        ),
+    )
+    root_dispatch_delay: DistributionSummary | None = Field(
+        default=None,
+        description=(
+            "Dispatch delay for the first request of each conversation. "
+            "Later turns are omitted. None when no first turn has a dispatch delay"
+        ),
+    )
     request_streaming_iterations_count: StatusDistributionSummary = Field(
         description="Distribution of stream iterations for completed requests"
     )
@@ -816,6 +1106,18 @@ class GenerativeMetrics(StandardBaseDict):
     )
     total_token_count: StatusDistributionSummary = Field(
         description="Distribution of total token counts by request status"
+    )
+    cached_token_count: StatusDistributionSummary = Field(
+        description=(
+            "Distribution of prompt token counts served from the prefix cache by "
+            "request status"
+        )
+    )
+    prefix_cache_hit_rate: StatusDistributionSummary = Field(
+        description=(
+            "Distribution of the share of each request's prompt tokens served from "
+            "the prefix cache by request status"
+        )
     )
     time_to_first_token_ms: StatusDistributionSummary = Field(
         description="Distribution of first token latencies in milliseconds"
@@ -880,6 +1182,16 @@ class GenerativeMetrics(StandardBaseDict):
         description="Tool call metrics for tokens and call counts"
     )
 
+    # Multi-turn stats, populated only when requests span more than one turn
+    turns: list[GenerativeTurnMetrics] | None = Field(
+        default=None,
+        description=(
+            "Per-turn-position distributions for multi-turn workloads, one "
+            "entry per observed turn index in ascending order. None when every "
+            "request is at turn 0"
+        ),
+    )
+
     # Goodput stats, populated only when latency objectives are configured
     slo_attainment: float | None = Field(
         default=None,
@@ -907,6 +1219,23 @@ class GenerativeMetrics(StandardBaseDict):
             "are directly comparable. None when no objectives are configured"
         ),
     )
+    output_token_goodput: StatusDistributionSummary | None = Field(
+        default=None,
+        description=(
+            "Distribution of output tokens per second from successful requests "
+            "meeting every objective, using the output throughput measurement "
+            "window and token-count fallback. None when goodput cannot be evaluated"
+        ),
+    )
+    slo_attainment_by_metric: dict[str, SLOAttainmentSummary] | None = Field(
+        default=None,
+        description=(
+            "Independent attainment for each configured objective, keyed by "
+            "ttft_ms, tpot_ms or e2el_ms. Each denominator excludes successful "
+            "requests missing that objective's measurement and includes errors. "
+            "None when no objectives are configured"
+        ),
+    )
 
     @classmethod
     def _compile_goodput(
@@ -916,7 +1245,13 @@ class GenerativeMetrics(StandardBaseDict):
         errored: list[GenerativeRequestStats],
         start_time: float,
         end_time: float,
-    ) -> tuple[float | None, int, StatusDistributionSummary | None]:
+    ) -> tuple[
+        float | None,
+        int,
+        StatusDistributionSummary | None,
+        StatusDistributionSummary | None,
+        dict[str, SLOAttainmentSummary] | None,
+    ]:
         """
         Compile goodput attainment and rate against configured latency objectives.
 
@@ -940,17 +1275,21 @@ class GenerativeMetrics(StandardBaseDict):
         :param errored: Errored request statistics within the window
         :param start_time: Measurement window start timestamp
         :param end_time: Measurement window end timestamp
-        :return: Tuple of (attainment ratio, determined request count,
-            conforming request rate). The ratio and rate are None when no
-            objectives are configured or none could be evaluated
+        :return: Combined attainment, determined count, request goodput,
+            output-token goodput, and per-objective attainment. Combined metrics
+            are None when no objectives are configured or none can be evaluated
         """
         if slo is None:
-            return None, 0, None
+            return None, 0, None, None, None
 
         conforming: list[GenerativeRequestStats] = []
         determined = 0
+        by_metric = {
+            name: SLOAttainmentSummary(determined_requests=len(errored))
+            for name in slo.model_dump(exclude_none=True)
+        }
         for stats in successful:
-            verdict = slo.is_conforming(
+            verdicts = slo.evaluate_objectives(
                 ttft_ms=stats.time_to_first_token_ms,
                 tpot_ms=stats.inter_token_latency_ms,
                 e2el_ms=(
@@ -959,10 +1298,13 @@ class GenerativeMetrics(StandardBaseDict):
                     else None
                 ),
             )
-            if verdict is None:
+            for name, verdict in verdicts.items():
+                by_metric[name].determined_requests += verdict is not None
+                by_metric[name].conforming_requests += verdict is True
+            if None in verdicts.values():
                 continue
             determined += 1
-            if verdict:
+            if all(verdicts.values()):
                 conforming.append(stats)
 
         # An errored request produced no conforming response, so it lowers
@@ -974,7 +1316,7 @@ class GenerativeMetrics(StandardBaseDict):
             # there is no population to average over. Reporting 0.0 here would
             # read as "nothing met the objectives" rather than "the objectives
             # do not apply to this workload".
-            return None, 0, None
+            return None, 0, None, None, by_metric
 
         goodput = StatusDistributionSummary.rate_distribution_from_timings_function(
             function=lambda req: req.request_end_time,
@@ -985,7 +1327,24 @@ class GenerativeMetrics(StandardBaseDict):
             end_time=end_time,
         )
 
-        return len(conforming) / determined, determined, goodput
+        token_goodput = (
+            StatusDistributionSummary.rate_distribution_from_timings_function(
+                function=lambda req: req.output_tokens_timings,
+                successful=conforming,
+                incomplete=[],
+                errored=[],
+                start_time=start_time,
+                end_time=end_time,
+            )
+        )
+
+        return (
+            len(conforming) / determined,
+            determined,
+            goodput,
+            token_goodput,
+            by_metric,
+        )
 
     @classmethod
     def compile(cls, accumulator: GenerativeBenchmarkAccumulator) -> GenerativeMetrics:
@@ -1009,27 +1368,84 @@ class GenerativeMetrics(StandardBaseDict):
         incomplete = accumulator.incomplete.get_within_range(start_time, end_time)
         errored = accumulator.errored.get_within_range(start_time, end_time)
 
+        # Intervals are reported only for metrics recorded once per request, so
+        # that each value is one observation. Token-weighted metrics and derived
+        # rate distributions are left without them; see docs/en/guides/metrics.md.
+        uncertainty = (
+            None
+            if accumulator.config.confidence is None
+            else SampleUncertainty(confidence=accumulator.config.confidence)
+        )
+
         # Schedule-relative metrics describe lag against an arrival schedule.
         # Closed-loop strategies derive each target from the system's own
         # responses, so a delay measured against them is circular rather than a
         # coordinated-omission correction, and is reported as None instead.
         dispatch_delay: StatusDistributionSummary | None = None
         scheduled_latency: StatusDistributionSummary | None = None
+        predecessor_delay: StatusDistributionSummary | None = None
+        scheduling_delay: StatusDistributionSummary | None = None
         if accumulator.config.strategy.defines_arrival_schedule:
             dispatch_delay = StatusDistributionSummary.from_values_function(
                 function=lambda req: req.request_dispatch_delay,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             )
             scheduled_latency = StatusDistributionSummary.from_values_function(
                 function=lambda req: req.request_scheduled_latency,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
+            )
+            predecessor_delay = StatusDistributionSummary.from_values_function(
+                function=lambda req: req.turn_predecessor_delay,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+            )
+            scheduling_delay = StatusDistributionSummary.from_values_function(
+                function=lambda req: req.turn_scheduling_delay,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
             )
 
-        slo_attainment, slo_determined, request_goodput = cls._compile_goodput(
+        # First-token and inter-token latencies are windowed by when the first
+        # token arrived rather than by request end. Filter once so the
+        # aggregate and per-turn distributions cover the same requests.
+        first_token_requests = (
+            accumulator.completed.get_within_range(
+                start_time, end_time, end_func=lambda req: req.first_token_iteration
+            ),
+            accumulator.incomplete.get_within_range(
+                start_time, end_time, end_func=lambda req: req.first_token_iteration
+            ),
+            accumulator.errored.get_within_range(
+                start_time, end_time, end_func=lambda req: req.first_token_iteration
+            ),
+        )
+        after_first_token_requests = (
+            accumulator.completed.get_within_range(
+                start_time, end_time, start_func=lambda req: req.first_token_iteration
+            ),
+            accumulator.incomplete.get_within_range(
+                start_time, end_time, start_func=lambda req: req.first_token_iteration
+            ),
+            accumulator.errored.get_within_range(
+                start_time, end_time, start_func=lambda req: req.first_token_iteration
+            ),
+        )
+
+        (
+            slo_attainment,
+            slo_determined,
+            request_goodput,
+            output_token_goodput,
+            slo_attainment_by_metric,
+        ) = cls._compile_goodput(
             slo=accumulator.config.slo,
             successful=successful,
             errored=errored,
@@ -1041,6 +1457,8 @@ class GenerativeMetrics(StandardBaseDict):
             slo_attainment=slo_attainment,
             slo_determined_requests=slo_determined,
             request_goodput=request_goodput,
+            output_token_goodput=output_token_goodput,
+            slo_attainment_by_metric=slo_attainment_by_metric,
             # Request stats
             request_totals=StatusBreakdown(
                 successful=len(successful),
@@ -1076,14 +1494,21 @@ class GenerativeMetrics(StandardBaseDict):
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             ),
             request_dispatch_delay=dispatch_delay,
             request_scheduled_latency=scheduled_latency,
+            turn_predecessor_delay=predecessor_delay,
+            turn_scheduling_delay=scheduling_delay,
+            root_dispatch_delay=root_dispatch_delay_distribution(
+                [*successful, *incomplete, *errored],
+            ),
             request_streaming_iterations_count=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.info.timings.request_iterations or 0.0,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             ),
             # General token stats
             prompt_token_count=StatusDistributionSummary.from_values_function(
@@ -1091,50 +1516,58 @@ class GenerativeMetrics(StandardBaseDict):
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             ),
             output_token_count=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.output_tokens or 0.0,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             ),
             total_token_count=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.total_tokens or 0.0,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
+            ),
+            cached_token_count=StatusDistributionSummary.from_values_function(
+                function=lambda req: req.cached_tokens,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+                uncertainty=uncertainty,
+            ),
+            prefix_cache_hit_rate=StatusDistributionSummary.from_values_function(
+                function=lambda req: req.prefix_cache_hit_rate,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+                uncertainty=uncertainty,
             ),
             # TODO: Need to evaluate closed=False vs closed=True for first-token
             # latencies. See github.com/vllm-project/guidellm/issues/1078
             time_to_first_token_ms=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.time_to_first_token_ms or 0.0,
-                successful=accumulator.completed.get_within_range(
-                    start_time,
-                    end_time,
-                    end_func=lambda req: req.first_token_iteration,
-                ),
-                incomplete=accumulator.incomplete.get_within_range(
-                    start_time,
-                    end_time,
-                    end_func=lambda req: req.first_token_iteration,
-                ),
-                errored=accumulator.errored.get_within_range(
-                    start_time,
-                    end_time,
-                    end_func=lambda req: req.first_token_iteration,
-                ),
+                successful=first_token_requests[0],
+                incomplete=first_token_requests[1],
+                errored=first_token_requests[2],
+                uncertainty=uncertainty,
             ),
             time_to_last_round_trip_ms=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.time_to_last_round_trip_ms or 0.0,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             ),
             avg_round_trip_time_ms=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.avg_round_trip_time_ms or 0.0,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
+                uncertainty=uncertainty,
             ),
             time_to_first_output_token_ms=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.time_to_first_output_token_ms or 0.0,
@@ -1153,6 +1586,7 @@ class GenerativeMetrics(StandardBaseDict):
                     end_time,
                     end_func=lambda req: req.first_output_token_iteration,
                 ),
+                uncertainty=uncertainty,
             ),
             time_per_output_token_ms=StatusDistributionSummary.from_values_function(
                 function=lambda req: (
@@ -1168,21 +1602,9 @@ class GenerativeMetrics(StandardBaseDict):
                     req.inter_token_latency_ms or 0.0,
                     (req.output_tokens or 1.0) - 1.0,
                 ),
-                successful=accumulator.completed.get_within_range(
-                    start_time,
-                    end_time,
-                    start_func=lambda req: req.first_token_iteration,
-                ),
-                incomplete=accumulator.incomplete.get_within_range(
-                    start_time,
-                    end_time,
-                    start_func=lambda req: req.first_token_iteration,
-                ),
-                errored=accumulator.errored.get_within_range(
-                    start_time,
-                    end_time,
-                    start_func=lambda req: req.first_token_iteration,
-                ),
+                successful=after_first_token_requests[0],
+                incomplete=after_first_token_requests[1],
+                errored=after_first_token_requests[2],
             ),
             prompt_tokens_per_second=StatusDistributionSummary.rate_distribution_from_timings_function(
                 function=lambda req: req.prompt_tokens_timing,
@@ -1239,5 +1661,11 @@ class GenerativeMetrics(StandardBaseDict):
             ),
             tool_call=GenerativeToolCallMetricsSummary.compile(
                 successful=successful, incomplete=incomplete, errored=errored
+            ),
+            # Multi-turn stats
+            turns=GenerativeTurnMetrics.compile_by_turn(
+                requests=(successful, incomplete, errored),
+                first_token_requests=first_token_requests,
+                after_first_token_requests=after_first_token_requests,
             ),
         )

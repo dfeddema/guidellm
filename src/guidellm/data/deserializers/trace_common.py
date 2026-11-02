@@ -40,6 +40,7 @@ from guidellm.data.schemas.conversation_graph_data import (
     ConversationParentRef,
     ConversationTurnData,
 )
+from guidellm.logger import logger
 from guidellm.schemas.data.deserializers import TraceDataArgs
 from guidellm.utils.registry import RegistryMixin
 
@@ -50,9 +51,11 @@ __all__ = [
     "create_distinct_token_block",
     "create_prompt_from_hash_ids",
     "decode_prompt",
+    "duration_columns",
     "fill_hash_id_table",
     "generate_token_ids",
     "get_missing_columns",
+    "tokenizer_supports_block_concat",
 ]
 
 
@@ -94,18 +97,94 @@ def get_missing_columns(
     return [c for c in required_columns if c not in actual_columns]
 
 
+def duration_columns(row: dict, config: TraceDataArgs) -> dict[str, list[float]]:
+    """Map an optional duration column onto request scheduling columns.
+
+    :param row: Trace row that may contain ``config.duration_column``.
+    :param config: Trace format arguments naming that column.
+    :return: ``{"request_duration_column": [seconds]}`` when the column is
+        present and non-null, otherwise an empty dict.
+    """
+    column = config.duration_column
+    if column not in row or row[column] is None:
+        return {}
+    return {"request_duration_column": [float(row[column])]}
+
+
 def create_prompt_from_hash_ids(
     hash_ids: list[int],
     hash_id_table: dict[int, tuple[int, ...]],
     processor: PreTrainedTokenizerBase,
+    hash_id_text: dict[int, str] | None = None,
 ) -> str:
     """Returns a synthetic prompt from `hash_ids` using pre-generated token blocks.
 
-    Precondition: All ids in `hash_ids` appear in `hash_id_table`."""
-    prompt_token_ids = [
-        token for hash_id in hash_ids for token in hash_id_table[hash_id]
-    ]
-    return decode_prompt(processor, prompt_token_ids)
+    When ``hash_id_text`` is provided, each block is decoded to text at most once
+    (cached by hash ID) and the prompt is composed by concatenating the cached
+    block strings. This avoids re-decoding the full token list on every request,
+    which dominates DAG construction on multi-turn traces with heavy prefix reuse.
+    When ``hash_id_text`` is ``None`` the full concatenated token list is decoded
+    in a single call (the original, byte-exact behavior).
+
+    Precondition: All ids in ``hash_ids`` appear in ``hash_id_table``.
+
+    :param hash_ids: Ordered hash IDs for one prompt.
+    :param hash_id_table: Token blocks keyed by hash ID.
+    :param processor: Tokenizer used to decode token blocks to text.
+    :param hash_id_text: Optional decoded-text cache keyed by hash ID, with the
+        same lifetime/scope as ``hash_id_table``. When given, enables per-block
+        decode caching; when ``None``, the full token list is decoded at once.
+    :return: The composed prompt string.
+    """
+    if hash_id_text is None:
+        prompt_token_ids = [
+            token for hash_id in hash_ids for token in hash_id_table[hash_id]
+        ]
+        return decode_prompt(processor, prompt_token_ids)
+
+    parts: list[str] = []
+    for hash_id in hash_ids:
+        text = hash_id_text.get(hash_id)
+        if text is None:
+            text = decode_prompt(processor, list(hash_id_table[hash_id]))
+            hash_id_text[hash_id] = text
+        parts.append(text)
+    return "".join(parts)
+
+
+def tokenizer_supports_block_concat(processor: PreTrainedTokenizerBase) -> bool:
+    """Returns True if composing a prompt from separately decoded token blocks is
+    byte-identical to decoding the full token list at once.
+
+    The decoded-block cache composes each prompt by concatenating the decoded text
+    of individual hash-id blocks. That is exact only when
+    ``decode(a) + decode(b) == decode(a + b)`` holds for the tokenizer, which is the
+    case for byte-level BPE tokenizers (e.g. Qwen, Llama 3, GPT-2) but not for
+    tokenizers that normalize or insert separators at token boundaries (e.g.
+    SentencePiece). Callers reuse decoded blocks only when this returns True and
+    otherwise decode the full token list per request, so prompts stay byte-exact for
+    every tokenizer. Probed with ASCII text (every token boundary is single-byte) so
+    the result reflects the tokenizer's concatenation behavior, not UTF-8 splitting.
+
+    :param processor: Tokenizer to probe.
+    :return: True if per-block decode composition is byte-identical to full-list
+        decoding.
+    """
+    probe = (
+        "The quick brown fox jumps over the lazy dog. "
+        "Pack my box with five dozen liquor jugs 1234567890."
+    )
+    token_ids = list(processor.encode(probe))
+    full = decode_prompt(processor, token_ids)
+    tested_any_boundary = False
+    for split in range(1, len(token_ids)):
+        tested_any_boundary = True
+        first = decode_prompt(processor, token_ids[:split])
+        second = decode_prompt(processor, token_ids[split:])
+        if first + second != full:
+            return False
+    # With fewer than two tokens there is no boundary to verify; treat as unsafe.
+    return tested_any_boundary
 
 
 def create_distinct_token_block(
@@ -173,8 +252,20 @@ def _seeded_faker(random_seed: int, copy_index: int) -> Faker:
 
 class TraceFormatBase(Protocol):
     config: TraceDataArgs
+    dataset: Dataset
 
     def __init__(self, config, dataset: Dataset) -> None: ...
+
+    def has_duration_column(self) -> bool:
+        """
+        Return whether this trace includes the configured duration column.
+
+        The default checks top-level dataset columns. Nested formats override
+        this to look at the row shape they actually read. Called once at load.
+
+        :return: True when ``config.duration_column`` is present
+        """
+        return self.config.duration_column in self.dataset.column_names
 
     def __iter__(self) -> Iterable[Dataset]:
         """Returns the next conversation as a `Dataset`."""
@@ -228,6 +319,7 @@ class TraceFormatBase(Protocol):
                 "prompt_tokens_count_column": [turn[self.config.prompt_tokens_column]],
                 "output_tokens_count_column": [turn[self.config.output_tokens_column]],
                 "relative_timestamp_column": [relative_timestamp],
+                **duration_columns(turn, self.config),
             }
             turns.append(
                 ConversationTurnData(
@@ -329,6 +421,8 @@ class TraceExamplesIterable(_BaseExamplesIterable):
                 graph_data = self.format.build_conversation_graph(
                     conv, self.processor, faker_copy
                 )
+                if not graph_data.turns:
+                    continue
                 wait_timing.apply_wait_caps(graph_data)
                 shift_graph_timestamps(graph_data, pass_offset)
                 copy_min = min(copy_min, graph_min_timestamp(graph_data))
@@ -346,7 +440,8 @@ class TraceExamplesIterable(_BaseExamplesIterable):
                     },
                 )
                 self.format.reset()
-            pass_offset = copy_min + self.config.copy_offset * (copy_max - copy_min)
+            if math.isfinite(copy_min):
+                pass_offset = copy_min + self.config.copy_offset * (copy_max - copy_min)
 
     @property
     def is_typed(self) -> bool:
@@ -443,6 +538,12 @@ def _handle_column_search(config: TraceDataArgs, trace_format: TraceFormatBase) 
     missing = trace_format.find_required_columns(list(features.keys()))
     if missing:
         raise DataNotSupportedError(f"Trace missing required columns: {missing}")
+    if not trace_format.has_duration_column():
+        logger.warning(
+            "Trace duration column '{}' is missing; schedule_turn=idle_gap "
+            "will treat each request as instantaneous.",
+            trace_format.config.duration_column,
+        )
 
 
 @DatasetDeserializerFactory.register(["trace_synthetic"])

@@ -5,9 +5,26 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from rich.highlighter import ReprHighlighter
+from rich.text import Text
 
-from guidellm.benchmark.outputs.console import GenerativeBenchmarkerConsole
-from guidellm.schemas import StatusBreakdown, StatusDistributionSummary
+from guidellm.benchmark.outputs.console import (
+    UNSUPPORTED_PERCENTILE_FOOTNOTE,
+    UNSUPPORTED_PERCENTILE_MARKER,
+    ConsoleTableColumnsCollection,
+    GenerativeBenchmarkerConsole,
+)
+from guidellm.benchmark.schemas.metrics import SLOAttainmentSummary
+from guidellm.scheduler import ConcurrentStrategy
+from guidellm.schemas import (
+    ConfidenceInterval,
+    DistributionSummary,
+    Percentiles,
+    SampleUncertainty,
+    StatusBreakdown,
+    StatusDistributionSummary,
+)
+from guidellm.schemas.benchmark import GoodputSLO
 
 # Metrics read by GenerativeBenchmarkerConsole.print_server_throughput_table.
 THROUGHPUT_TABLE_METRICS = (
@@ -110,6 +127,8 @@ def _make_throughput_benchmark(
         **dict.fromkeys(THROUGHPUT_TABLE_METRICS, distribution),
         slo_attainment=attainment,
         request_goodput=goodput,
+        output_token_goodput=None,
+        slo_attainment_by_metric=None,
     )
 
     return SimpleNamespace(
@@ -146,6 +165,83 @@ class TestServerThroughputTableGoodput:
 
     ## WRITTEN BY AI ##
     """
+
+    @pytest.mark.regression
+    @pytest.mark.parametrize("token_rate", [0.0, 12.5, None])
+    def test_output_token_goodput_renders_zero_and_unavailable(self, token_rate):
+        """Distinguish a zero token rate from unavailable goodput metrics.
+
+        ## WRITTEN BY AI ##
+        """
+        benchmark = _make_throughput_benchmark(attainment=0.5, goodput=None)
+        if token_rate is not None:
+            benchmark.metrics.output_token_goodput = (
+                StatusDistributionSummary.from_values([token_rate], [], [])
+            )
+        headers, values = _render_throughput_table([benchmark])
+
+        assert "Output Tok/Sec" in headers
+        assert values[-1] == ["--" if token_rate is None else f"{token_rate:.1f}"]
+
+    @pytest.mark.regression
+    def test_individual_objective_table_keeps_counts_and_missing_results(self, mocker):
+        """Group objectives by benchmark, including duplicate strategy labels.
+
+        ## WRITTEN BY AI ##
+        """
+        measured = _make_throughput_benchmark(attainment=0.5, goodput=None)
+        measured.config.slo = GoodputSLO(ttft_ms=200, tpot_ms=10)
+        measured.metrics.slo_attainment_by_metric = {
+            "ttft_ms": SLOAttainmentSummary(
+                conforming_requests=2, determined_requests=3
+            ),
+            "tpot_ms": SLOAttainmentSummary(),
+        }
+        legacy = _make_throughput_benchmark(attainment=0.5, goodput=None)
+        legacy.config.slo = GoodputSLO(e2el_ms=2000)
+        no_objectives = _make_throughput_benchmark(attainment=None, goodput=None)
+        output = GenerativeBenchmarkerConsole()
+        mocker.patch.object(output.console, "print")
+        table = mocker.patch.object(output.console, "print_table")
+
+        output.print_slo_attainment_table(
+            SimpleNamespace(benchmarks=[measured, legacy, no_objectives])
+        )
+
+        headers, values = table.call_args.args
+        columns = {
+            header[1]: column for header, column in zip(headers, values, strict=True)
+        }
+        assert [header[0] for header in headers] == [
+            "Benchmark",
+            "SLO",
+            "SLO",
+            "SLO",
+            "Requests",
+            "Requests",
+            "Requests",
+        ]
+        strategy = str(measured.config.strategy)
+        assert str(legacy.config.strategy) == strategy
+        assert columns["Strategy"] == [strategy, "", strategy]
+        assert columns["Objective"] == ["TTFT", "TPOT", "E2EL"]
+        assert columns["Passing"] == ["2", "0", "--"]
+        assert columns["Evaluated"] == ["3", "0", "--"]
+        assert columns["Attainment"] == ["66.7", "--", "--"]
+        assert columns["Units"] == ["ms", "ms/token", "ms"]
+
+    @pytest.mark.regression
+    def test_individual_objective_table_is_omitted_without_slos(self, mocker):
+        """Leave the console output unchanged for runs without objectives.
+
+        ## WRITTEN BY AI ##
+        """
+        output = GenerativeBenchmarkerConsole()
+        table = mocker.patch.object(output.console, "print_table")
+        output.print_slo_attainment_table(
+            SimpleNamespace(benchmarks=[_make_throughput_benchmark(None, None)])
+        )
+        table.assert_not_called()
 
     @pytest.mark.regression
     def test_omits_goodput_columns_without_objectives(self):
@@ -237,13 +333,18 @@ def _make_run_summary_benchmark(
     successful: int = 8,
     incomplete: int = 2,
     errored: int = 1,
+    strategy: object | None = None,
 ) -> SimpleNamespace:
     """Build a benchmark stub exposing every metric the run summary table reads.
 
     ## WRITTEN BY AI ##
     """
     return SimpleNamespace(
-        config=SimpleNamespace(strategy=SimpleNamespace(type_="constant")),
+        config=SimpleNamespace(
+            strategy=strategy
+            if strategy is not None
+            else SimpleNamespace(type_="constant")
+        ),
         start_time=1_700_000_000.0,
         end_time=1_700_000_060.0,
         duration=60.0,
@@ -307,3 +408,311 @@ class TestRunSummaryTable:
         assert any("8" in column for column in values)
         assert any("2" in column for column in values)
         assert any("1" in column for column in values)
+
+
+class TestRunSummaryTableStrategyLabel:
+    """
+    Verify the run summary Strategy column keeps its parameterized label.
+
+    ## WRITTEN BY AI ##
+    """
+
+    @pytest.mark.regression
+    def test_concurrent_rows_keep_their_stream_count(self):
+        """
+        Each concurrent sub-benchmark renders as ``concurrent@<streams>`` so the
+        rows stay distinguishable, instead of collapsing to a bare ``concurrent``.
+
+        Rendering the discriminator (``strategy.type_``) would label every
+        concurrent row ``concurrent`` in the final tables, even though the live
+        progress display tells them apart as ``concurrent@1`` / ``concurrent@2``.
+        The Strategy column must use ``str(strategy)`` to match.
+
+        ## WRITTEN BY AI ##
+        """
+        _, values = _render_run_summary_table(
+            [
+                _make_run_summary_benchmark(strategy=ConcurrentStrategy(streams=1)),
+                _make_run_summary_benchmark(strategy=ConcurrentStrategy(streams=2)),
+            ]
+        )
+
+        cells = [cell for column in values for cell in column]
+        assert "concurrent@1" in cells
+        assert "concurrent@2" in cells
+        assert "concurrent" not in cells
+
+
+def _render_latency_table_values(
+    with_intervals: bool = True,
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Render the latency table and return its headers and cell values.
+
+    ## WRITTEN BY AI ##
+    """
+    uncertainty = SampleUncertainty(confidence=0.95) if with_intervals else None
+    samples = [float(index) for index in range(200)]
+    per_request = StatusDistributionSummary.from_values(
+        samples, [], [], uncertainty=uncertainty
+    )
+    # Weighted values stand in for ITL and TPOT, which carry an exposure weight
+    # and so are reported without an interval.
+    weighted = StatusDistributionSummary.from_values(
+        [(value, 1.0 + index % 5) for index, value in enumerate(samples)],
+        [],
+        [],
+        uncertainty=uncertainty,
+    )
+    metrics = SimpleNamespace(
+        request_latency=per_request,
+        time_to_first_token_ms=per_request,
+        time_to_first_output_token_ms=per_request,
+        inter_token_latency_ms=weighted,
+        time_per_output_token_ms=weighted,
+    )
+    benchmark = SimpleNamespace(
+        config=SimpleNamespace(strategy=SimpleNamespace(type_="constant")),
+        metrics=metrics,
+    )
+
+    captured: dict[str, object] = {}
+    output = GenerativeBenchmarkerConsole()
+    output.console.print = lambda *args, **kwargs: None
+    output.console.print_table = lambda headers, values, title=None: captured.update(
+        headers=headers, values=values
+    )
+    output.print_request_latency_table(SimpleNamespace(benchmarks=[benchmark]))
+
+    return captured["headers"], captured["values"]  # type: ignore[return-value]
+
+
+class TestRequestLatencyTableIntervals:
+    """
+    Verify how the latency table renders a mean alongside its margin.
+
+    ## WRITTEN BY AI ##
+    """
+
+    @pytest.mark.smoke
+    def test_mean_column_carries_a_margin(self):
+        """
+        A per-request metric renders as a mean followed by its margin.
+
+        ## WRITTEN BY AI ##
+        """
+        headers, values = _render_latency_table_values()
+
+        mean_columns = [
+            index for index, header in enumerate(headers) if header[-1] == "Mean"
+        ]
+        assert mean_columns
+        rendered = [values[index][0] for index in mean_columns]
+        assert any("±" in cell for cell in rendered)
+
+    @pytest.mark.sanity
+    def test_weighted_metrics_render_without_a_margin(self):
+        """
+        ITL and TPOT show the mean alone, since they carry no interval.
+
+        ## WRITTEN BY AI ##
+        """
+        headers, values = _render_latency_table_values()
+
+        for index, header in enumerate(headers):
+            if header[0] in ("ITL", "TPOT") and header[-1] == "Mean":
+                assert "±" not in values[index][0]
+
+    @pytest.mark.sanity
+    def test_margin_is_omitted_when_no_interval_was_estimated(self):
+        """
+        Without an estimator the column shows the bare mean.
+
+        ## WRITTEN BY AI ##
+        """
+        headers, values = _render_latency_table_values(with_intervals=False)
+
+        for index, header in enumerate(headers):
+            if header[-1] == "Mean":
+                assert "±" not in values[index][0]
+
+    @pytest.mark.regression
+    def test_margin_sign_is_followed_by_a_space(self):
+        """
+        The plus-minus sign has a space after it.
+
+        The sign has ambiguous East Asian width, and some fonts draw it wider
+        than one cell. Without the space it covers the first digit of the margin.
+
+        ## WRITTEN BY AI ##
+        """
+        _, values = _render_latency_table_values()
+
+        margins = [cell for column in values for cell in column if "±" in cell]
+        assert margins
+        assert all("± " in cell for cell in margins)
+
+    @pytest.mark.regression
+    def test_margin_is_highlighted_like_the_mean(self):
+        """
+        Rich highlights the margin as a number, the same as the mean.
+
+        An ASCII +/- is read by Rich's highlighter as a path, which colours the
+        margin differently from the value it qualifies.
+
+        ## WRITTEN BY AI ##
+        """
+        _, values = _render_latency_table_values()
+
+        margins = [cell for column in values for cell in column if "±" in cell]
+        assert margins
+        for cell in margins:
+            text = Text(cell)
+            ReprHighlighter().highlight(text)
+            assert {str(span.style) for span in text.spans} == {"repr.number"}
+
+    @pytest.mark.regression
+    def test_margin_keeps_enough_precision_to_be_visible(self):
+        """
+        A margin smaller than the column precision is not rendered as zero.
+
+        Rounding it away would present an imprecise measurement as an exact one.
+
+        ## WRITTEN BY AI ##
+        """
+        distribution = DistributionSummary(
+            mean=1.0,
+            median=1.0,
+            mode=1.0,
+            variance=0.0,
+            std_dev=0.0,
+            min=1.0,
+            max=1.0,
+            count=10,
+            total_sum=10.0,
+            percentiles=Percentiles(
+                **dict.fromkeys(
+                    [
+                        "p001",
+                        "p01",
+                        "p05",
+                        "p10",
+                        "p25",
+                        "p50",
+                        "p75",
+                        "p90",
+                        "p95",
+                        "p99",
+                        "p999",
+                    ],
+                    1.0,
+                )
+            ),
+            mean_ci=ConfidenceInterval(lower=0.98, upper=1.02),
+        )
+
+        rendered = ConsoleTableColumnsCollection._format_mean_with_margin(
+            distribution, precision=1
+        )
+
+        assert rendered == "1.0 ± 0.02"
+
+
+def _render_latency_table_with_footnote(
+    sample_size: int,
+) -> tuple[list[list[str]], list[list[str]], list[str]]:
+    """Render the latency table for a sample of the given size.
+
+    ## WRITTEN BY AI ##
+    """
+    samples = [float(index) for index in range(sample_size)]
+    distribution = StatusDistributionSummary.from_values(
+        samples, [], [], uncertainty=SampleUncertainty(confidence=0.95)
+    )
+    metrics = SimpleNamespace(
+        **dict.fromkeys(LATENCY_TABLE_METRICS, distribution),
+    )
+    benchmark = SimpleNamespace(
+        config=SimpleNamespace(strategy=SimpleNamespace(type_="constant")),
+        metrics=metrics,
+    )
+
+    captured: dict[str, object] = {}
+    printed: list[str] = []
+    output = GenerativeBenchmarkerConsole()
+    output.console.print = lambda *args, **kwargs: printed.extend(
+        str(arg) for arg in args
+    )
+    output.console.print_table = lambda headers, values, title=None: captured.update(
+        headers=headers, values=values
+    )
+    output.print_request_latency_table(SimpleNamespace(benchmarks=[benchmark]))
+
+    return captured["headers"], captured["values"], printed  # type: ignore[return-value]
+
+
+class TestUnsupportedPercentileMarker:
+    """
+    Verify the console marks a percentile the sample cannot bound.
+
+    ## WRITTEN BY AI ##
+    """
+
+    @staticmethod
+    def _p95_cells(headers, values) -> list[str]:
+        """Collect the rendered p95 cells.
+
+        ## WRITTEN BY AI ##
+        """
+        return [
+            values[index][0]
+            for index, header in enumerate(headers)
+            if header[-1] == "p95"
+        ]
+
+    @pytest.mark.smoke
+    def test_marks_p95_below_the_supporting_sample_size(self):
+        """
+        A sample too small to bound p95 renders the value with a marker.
+
+        Seventy-one observations cannot place an observation above the 95th
+        percentile often enough to form a two-sided interval, so the point
+        estimate stands alone and says so.
+
+        ## WRITTEN BY AI ##
+        """
+        headers, values, printed = _render_latency_table_with_footnote(71)
+
+        cells = self._p95_cells(headers, values)
+        assert cells
+        assert all(cell.endswith(UNSUPPORTED_PERCENTILE_MARKER) for cell in cells)
+        assert UNSUPPORTED_PERCENTILE_FOOTNOTE in printed
+
+    @pytest.mark.sanity
+    def test_leaves_p95_unmarked_once_the_sample_supports_it(self):
+        """
+        One more observation removes the marker and the footnote.
+
+        ## WRITTEN BY AI ##
+        """
+        headers, values, printed = _render_latency_table_with_footnote(72)
+
+        cells = self._p95_cells(headers, values)
+        assert cells
+        assert not any(cell.endswith(UNSUPPORTED_PERCENTILE_MARKER) for cell in cells)
+        assert UNSUPPORTED_PERCENTILE_FOOTNOTE not in printed
+
+    @pytest.mark.regression
+    def test_metrics_without_intervals_are_not_marked(self):
+        """
+        A metric reported without intervals is not marked as sample-limited.
+
+        ITL and TPOT carry no interval by design rather than for want of
+        observations, so marking them would misattribute the reason.
+
+        ## WRITTEN BY AI ##
+        """
+        headers, values = _render_latency_table_values(with_intervals=True)
+
+        for index, header in enumerate(headers):
+            if header[0] in ("ITL", "TPOT") and header[-1] == "p95":
+                assert not values[index][0].endswith(UNSUPPORTED_PERCENTILE_MARKER)

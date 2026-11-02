@@ -32,7 +32,7 @@ guidellm run \
 ```bash
 guidellm run \
   --backend kind=openai_http,target=http://localhost:8000 \
-  --profile kind=replay \
+  --profile kind=replay,prefetch=all \
   --data kind=weka,source.kind=huggingface,source.source=semianalysisai/cc-traces-weka-no-subagents-051226 \
   --constraint kind=max_requests,count=30
 ```
@@ -66,6 +66,7 @@ All trace formats can accept the following optional data arguments:
 | `timestamp_column`        | "timestamp"     | Column name for timestamps in the trace file                                                    |
 | `prompt_tokens_column`    | "input_length"  | Column name for prompt token counts in the trace file                                           |
 | `output_tokens_column`    | "output_length" | Column name for output token counts in the trace file                                           |
+| `duration_column`         | "duration"      | Optional column for how long each request ran, in seconds. Used by `schedule_turn=idle_gap`     |
 | `time_scale`              | 1.0             | Scale remaining relative timestamps after wait and pack caps                                    |
 | `max_wait`                | unset           | Maximum gap in original trace seconds between consecutive requests in one session               |
 | `max_session_wait`        | unset           | Maximum idle in original trace seconds from the previous session's last request to this session |
@@ -83,6 +84,8 @@ guidellm run \
 ```
 
 `trace_synthetic` can be thought of as the format-agnostic option, only looking for the timestamp, prompt token count and output token count columns and ignoring all other features contained in a dataset. While primarily used for testing, `trace_synthetic` may be used as a fallback for trace formats not currently supported by GuideLLM.
+
+The replay profile's `schedule_turn` argument selects how those timestamps are applied. `idle_gap` (the default) keeps the idle gap after `duration_column`: a request recorded as 1 second with the next timestamp 5 seconds later starts that next request 4 seconds after this one actually finishes. `idle_gap` is more forgiving for when the server gets overloaded, since late requests all get sent as soon as the prior turns end. If `duration_column` is missing, the loader logs one warning, and each request is treated as instantaneous. This results in the actual gap being marginally longer. `timestamp` starts each request at its trace time, waiting only if the prior turn is still running.
 
 `trace_synthetic` and `mooncake` replay each row as an independent, single-request conversation. Rows are sorted by timestamp and keep their offsets from the first request in the trace. Prompts are generated as rows are consumed, and Mooncake hash IDs remain shared across rows within one `copies` pass. Use `max_session_wait` to cap gaps between these independent requests; `max_wait` only caps gaps within multi-request conversations, such as WEKA sessions.
 
@@ -109,10 +112,14 @@ Similar to Mooncake, WEKA uses prefix-based cache hash IDs. The original [specif
 
 GuideLLM will generate prompts starting from the first conversation. When the conversation ends, the next conversation will be used. Relative timestamps are offsets from the earliest request in the dataset, so later conversations can start later than the first.
 
+In general, it is safer to use `prefetch=all` when using WEKA traces. The only situation where you do not need to is when the sessions in a trace are in the correct order without overlap. Otherwise, the data deserializer may fall behind, resulting in sessions being scheduled after their relative trace time. The problem is exacerbated when most or all sessions have requests that start at or near the start of the benchmark. All requests must be pre-fetched to ensure all sessions start when they need to. Use `--profile kind=replay,prefetch=all` so those graphs finish loading before the run clock starts. See [Requests load after they are due](troubleshooting.md#requests-load-after-they-are-due).
+
 Hash IDs follow the per-row `hash_id_scope` field:
 
 - `"global"` or omitted: hash IDs share one token-block table across conversations, matching Mooncake. The same hash ID in a later conversation reuses the earlier token block so prefix-cache hit rate stays close to the original trace. Each `copies` pass uses a separately salted global table.
 - `"local"`: hash IDs apply only within that conversation. The table is discarded after the conversation is emitted. Local isolation also applies independently on each `copies` pass.
+
+To speed up prompt generation, each hash-id token block can be decoded to text once and the decoded string reused wherever that block recurs (the cache shares the token table's lifetime and scope). On multi-turn agentic traces, where successive turns re-send almost the same context, this decodes only unique blocks instead of every request's full token list. This reuse is enabled automatically, but only for tokenizers where composing a prompt from separately decoded blocks is byte-identical to decoding the full token list at once — true for byte-level BPE tokenizers (e.g. Qwen, Llama 3, GPT-2). For other tokenizers (e.g. SentencePiece) the deserializer transparently falls back to decoding the full token list per request, so generated prompts are byte-exact for every tokenizer. Token counts and prefix-cache reuse are unchanged in both cases.
 
 Declared `type: "subagent"` entries become isolated child chains. Each child spawns from the preceding parent API turn with a fresh history (`history_context="new"`) and the following parent turn waits for every sibling spawned since that turn (`history_context="last"`). Multiple subagents listed between the same parent turns therefore run in parallel; the parent resumes only after all of them complete. Request-list order is preserved at every nesting level (it is the spawn/join topology) and is not sorted by timestamp.
 

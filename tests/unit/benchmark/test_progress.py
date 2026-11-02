@@ -5,20 +5,30 @@ import sys
 from io import StringIO
 
 import pytest
+from logot import Logot
+from logot.logged import info
 from rich.console import Console
 
 from guidellm.benchmark import progress as progress_module
 from guidellm.benchmark.profiles import ProfileFactory
 from guidellm.benchmark.progress import (
+    CompositeBenchmarkerProgress,
     GenerativeConsoleBenchmarkerProgress,
     GenerativeLoggingBenchmarkerProgress,
+    _GenerativeProgressTaskState,
 )
 from guidellm.benchmark.schemas import (
     BenchmarkConfig,
     GenerativeBenchmark,
     GenerativeBenchmarkAccumulator,
 )
-from guidellm.scheduler import SchedulerState, SynchronousStrategy
+from guidellm.scheduler import ConcurrentStrategy, SchedulerState, SynchronousStrategy
+from guidellm.schemas import (
+    GenerativeRequestStats,
+    RequestInfo,
+    RequestTimings,
+    UsageMetrics,
+)
 from guidellm.schemas.benchmark.profiles import SynchronousProfileArgs
 
 
@@ -67,6 +77,51 @@ async def test_rich_lifecycle_still_renders(accumulator):
             await progress.on_finalize()
     assert "Benchmarks" in captured.get()
     assert progress.tasks_progress is None
+
+
+@pytest.mark.regression
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_update", [1.0, 2.0, 4.0])
+async def test_compile_is_visible_before_compilation(
+    monkeypatch, accumulator, last_update, logot: Logot
+):
+    """Refresh compile immediately from any execution phase, then complete.
+
+    ## WRITTEN BY AI ##
+    """
+    monkeypatch.setattr(progress_module, "monotonic", lambda: 100.0)
+    accumulator.timings.current_update = last_update
+    display = GenerativeConsoleBenchmarkerProgress(cleanup=False)
+    display.console = Console(file=StringIO(), force_terminal=True, width=200)
+    progress = CompositeBenchmarkerProgress(
+        [display, GenerativeLoggingBenchmarkerProgress(interval=10)]
+    )
+    profile = ProfileFactory.create(SynchronousProfileArgs(), random_seed=0)
+    scheduler_state = SchedulerState(successful_requests=12, errored_requests=2)
+    try:
+        await progress.on_initialize(profile)
+        await progress.on_benchmark_start(SynchronousStrategy())
+        await progress.on_benchmark_update(accumulator, scheduler_state)
+        assert display.tasks_progress is not None
+        task_state = display.tasks_progress.benchmark_task_states[0]
+        assert task_state.benchmark_status == accumulator.timings.status
+        requests_summary = task_state.formatted_requests_summary
+
+        await progress.on_benchmark_compile()
+
+        assert task_state.benchmark_status == "compile"
+        assert task_state.formatted_requests_summary == requests_summary
+        logot.assert_logged(
+            info("Benchmark 1 (%s): started | %s")
+            >> info("Benchmark 1 (%s): compile | %s")
+        )
+
+        benchmark = GenerativeBenchmark.compile(accumulator, scheduler_state)
+        await progress.on_benchmark_complete(benchmark)
+        assert task_state.benchmark_status == "completed"
+        logot.assert_logged(info("Benchmark 1 (%s): completed | %s"))
+    finally:
+        await progress.on_finalize()
 
 
 @pytest.mark.regression
@@ -178,3 +233,62 @@ async def test_queued_logs_share_rich_terminal(monkeypatch, accumulator):
     assert ": started |" in output.getvalue()
     assert ": completed |" in output.getvalue()
     assert sys.stderr is output
+
+
+@pytest.mark.smoke
+def test_prefetch_shows_loading_until_update(accumulator):
+    """
+    Prefetch renders loading with blank summaries until the first update.
+
+    ## WRITTEN BY AI ##
+    """
+    task_state = _GenerativeProgressTaskState(strategy_type="concurrent")
+    task_state.start(ConcurrentStrategy(streams=4, prefetch=4))
+
+    assert task_state.benchmark_status == "loading"
+    assert "loading" in task_state.formatted_progress_status
+    assert task_state.formatted_requests_summary == " "
+    assert task_state.formatted_tokens_summary == " "
+    assert task_state.formatted_scheduler_stats == " "
+
+    task_state.update(accumulator, SchedulerState())
+
+    assert task_state.benchmark_status == "active"
+
+    loading_all = _GenerativeProgressTaskState(strategy_type="synchronous")
+    loading_all.start(SynchronousStrategy(prefetch="all"))
+
+    assert loading_all.benchmark_status == "loading"
+    assert loading_all.formatted_requests_summary == " "
+
+
+@pytest.mark.regression
+def test_live_update_shows_output_tokens(accumulator):
+    """The live "Gen" figure is the mean output tokens, not the mean total tokens.
+
+    ## WRITTEN BY AI ##
+    """
+    for index in range(4):
+        timings = RequestTimings(
+            resolve_start=1.0 + index,
+            resolve_end=2.0 + index,
+            request_start=1.0 + index,
+            request_end=2.0 + index,
+        )
+        accumulator.completed_metrics.update_estimate(
+            GenerativeRequestStats(
+                request_id=f"req-{index}",
+                info=RequestInfo(
+                    request_id=f"req-{index}", status="completed", timings=timings
+                ),
+                input_metrics=UsageMetrics(text_tokens=100),
+                output_metrics=UsageMetrics(text_tokens=10),
+            ),
+            duration=10.0,
+        )
+
+    state = _GenerativeProgressTaskState(strategy_type="synchronous")
+    state.update(accumulator, SchedulerState(start_time=1.0))
+
+    assert state.prompt_tokens == 100
+    assert state.output_tokens == 10

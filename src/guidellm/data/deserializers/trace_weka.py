@@ -38,9 +38,11 @@ from guidellm.data.deserializers.trace_common import (
     _validate_api_row,
     create_prompt_from_hash_ids,
     decode_prompt,
+    duration_columns,
     fill_hash_id_table,
     generate_token_ids,
     get_missing_columns,
+    tokenizer_supports_block_concat,
 )
 from guidellm.data.schemas import InvalidRowError
 from guidellm.data.schemas.conversation_graph_data import (
@@ -274,6 +276,12 @@ class WEKATraceFormat(TraceFormatBase):
 
         self._hash_id_table: dict[int, tuple[int, ...]] = {}
         self._sibling_table: dict[Any, set[tuple[int, ...]]] = {}
+        # Decoded-text cache keyed by hash ID (same lifetime as the token table).
+        # Each block is decoded to text at most once and reused across turns, but
+        # only for tokenizers where per-block decode composition is byte-identical
+        # to full-list decoding (probed lazily once into ``self._concat_safe``).
+        self._hash_id_text: dict[int, str] = {}
+        self._concat_safe: bool | None = None
         # Filled by each ``__iter__`` pass so mixed subagent/API schemas are
         # not forced through a single HuggingFace Arrow table.
         self._conversations: list[tuple[str, list[dict[str, Any]], str | None]] = []
@@ -298,6 +306,7 @@ class WEKATraceFormat(TraceFormatBase):
         """
         self._hash_id_table = {}
         self._sibling_table = {}
+        self._hash_id_text = {}
         self._tool_response_sampler = None
 
     def __iter__(self) -> Iterable[Dataset]:
@@ -352,6 +361,22 @@ class WEKATraceFormat(TraceFormatBase):
             return required
         return get_missing_columns(required, list(first_api.keys()))
 
+    def has_duration_column(self) -> bool:
+        """
+        Return whether the first API request includes the duration column.
+
+        WEKA stores request fields inside the requests list, not as dataset
+        columns. Only the first API request is checked.
+
+        :return: True when ``config.duration_column`` is on that request
+        """
+        if self.config.duration_column in self.dataset.column_names:
+            return True
+        first_api = _first_api_request(self.dataset[self.requests_col][0])
+        if first_api is None:
+            return False
+        return self.config.duration_column in first_api
+
     def validate_row(self, row: dict) -> None:
         n_in = row[self.config.prompt_tokens_column]
         hash_ids = row.get(self.config.hash_ids_column)
@@ -382,6 +407,7 @@ class WEKATraceFormat(TraceFormatBase):
         faker: Faker,
         hash_id_table: dict[int, tuple[int, ...]] | None = None,
         sibling_token_blocks: dict[Any, set[tuple[int, ...]]] | None = None,
+        hash_id_text: dict[int, str] | None = None,
     ) -> str:
         """Before generating the prompt, this first generates a block of tokens for
         each hash ID that has not already been seen.
@@ -395,6 +421,9 @@ class WEKATraceFormat(TraceFormatBase):
             current copy's table.
         :param sibling_token_blocks: Distinctness set per previous hash ID, matching
             ``hash_id_table``'s lifetime. Defaults to the current copy's set.
+        :param hash_id_text: Decoded-text cache keyed by hash ID, matching
+            ``hash_id_table``'s lifetime. Each block is decoded at most once and
+            prompts are composed from the cached strings.
         """
         if hash_id_table is None:
             hash_id_table = self._hash_id_table
@@ -414,13 +443,44 @@ class WEKATraceFormat(TraceFormatBase):
             faker,
             lambda _idx, _hash_id: block_size,
         )
-        prompt = create_prompt_from_hash_ids(ids, hash_id_table, processor)
+        prompt = create_prompt_from_hash_ids(
+            ids, hash_id_table, processor, hash_id_text
+        )
         remainder = _generate_remaining_prompt(n_in % block_size, processor, faker)
         if not prompt:
             return remainder
         if not remainder:
             return prompt
         return f"{prompt} {remainder}"
+
+    def _hash_tables_for_scope(
+        self, hash_id_scope: str | None, processor: PreTrainedTokenizerBase
+    ) -> tuple[
+        dict[int, tuple[int, ...]],
+        dict[Any, set[tuple[int, ...]]],
+        dict[int, str] | None,
+    ]:
+        """Select the token, sibling, and decoded-text tables for a conversation.
+
+        Local scope uses throwaway tables so this conversation cannot reuse or
+        pollute the instance-level hash storage used by global/unset rows. Decoded
+        blocks are reused (``hash_id_text`` is non-``None``) only when the tokenizer
+        makes per-block decode composition byte-identical to full-list decoding;
+        otherwise the full token list is decoded per request so prompts stay exact.
+
+        :param hash_id_scope: ``"local"`` for per-conversation tables, else instance.
+        :param processor: Tokenizer, probed once to decide decoded-block reuse.
+        :return: ``(hash_id_table, sibling_token_blocks, hash_id_text)``.
+        """
+        if self._concat_safe is None:
+            self._concat_safe = tokenizer_supports_block_concat(processor)
+        if hash_id_scope == "local":
+            return {}, {}, ({} if self._concat_safe else None)
+        return (
+            self._hash_id_table,
+            self._sibling_table,
+            self._hash_id_text if self._concat_safe else None,
+        )
 
     def build_conversation_graph(
         self,
@@ -429,14 +489,9 @@ class WEKATraceFormat(TraceFormatBase):
         faker: Faker,
     ) -> ConversationGraphData:
         conv_id, requests, hash_id_scope = self._unpack_conversation(conversation)
-        # Local scope uses throwaway tables so this conversation cannot reuse
-        # or pollute the instance-level hash storage used by global/unset rows.
-        if hash_id_scope == "local":
-            hash_id_table: dict[int, tuple[int, ...]] = {}
-            sibling_token_blocks: dict[Any, set[tuple[int, ...]]] = {}
-        else:
-            hash_id_table = self._hash_id_table
-            sibling_token_blocks = self._sibling_table
+        hash_id_table, sibling_token_blocks, hash_id_text = self._hash_tables_for_scope(
+            hash_id_scope, processor
+        )
         specs, _last = self._emit_chain(
             requests,
             agent_id="default",
@@ -451,9 +506,33 @@ class WEKATraceFormat(TraceFormatBase):
             raise InvalidRowError(
                 "WEKA format: conversation has no API requests to replay"
             )
+        # One pass builds turns and stops at the first turn that would exceed
+        # the context budget, before prompt generation. The dataset origin is
+        # already known, so relative timestamps are written in this same pass.
+        max_len = self.config.max_context_len
+        prompt_col = self.config.prompt_tokens_column
+        output_col = self.config.output_tokens_column
         origin = 0.0 if self._trace_origin is None else self._trace_origin
+        running_tokens = 0
         turns: list[ConversationTurnData] = []
-        for spec in specs:
+        for index, spec in enumerate(specs):
+            if max_len is not None:
+                turn_tokens = int(spec.row[prompt_col]) + int(spec.row[output_col])
+                if running_tokens + turn_tokens > max_len:
+                    logger.debug(
+                        "WEKA conversation '{}' truncated: discarding {} "
+                        "turn(s) starting at node '{}' (turn tokens={}, "
+                        "running={})",
+                        conv_id,
+                        len(specs) - index,
+                        spec.node_id,
+                        turn_tokens,
+                        running_tokens,
+                    )
+                    if len(turns) < 1:
+                        return ConversationGraphData(turns=[])
+                    break
+                running_tokens += turn_tokens
             _validate_api_row(spec.row, self.config, self.validate_row)
             prompt = self.create_prompt(
                 spec.row,
@@ -461,16 +540,14 @@ class WEKATraceFormat(TraceFormatBase):
                 faker,
                 hash_id_table,
                 sibling_token_blocks,
+                hash_id_text,
             )
             columns: dict[str, Any] = {
                 "text_column": [prompt],
-                "prompt_tokens_count_column": [
-                    spec.row[self.config.prompt_tokens_column]
-                ],
-                "output_tokens_count_column": [
-                    spec.row[self.config.output_tokens_column]
-                ],
+                "prompt_tokens_count_column": [spec.row[prompt_col]],
+                "output_tokens_count_column": [spec.row[output_col]],
                 "relative_timestamp_column": [spec.absolute_t - origin],
+                **duration_columns(spec.row, self.config),
             }
             if spec.turn_type is not None:
                 columns["turn_type_column"] = [spec.turn_type]

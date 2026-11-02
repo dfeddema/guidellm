@@ -142,7 +142,8 @@ class _SyntheticTextExamplesIterable(_BaseExamplesIterable):
                     variance=self.config.tool_response_tokens_stdev,
                     min_value=self.config.tool_response_tokens_min,
                     max_value=self.config.tool_response_tokens_max,
-                    random_seed=iter_random_seed + 2,
+                    # ensure diff dist from delays, which use iter_random_seed + 2
+                    random_seed=iter_random_seed + 6,
                 )
             )
 
@@ -532,6 +533,12 @@ class SyntheticTextDataset(IterableDataset):
         """Set the epoch for the dataset iteration."""
         if isinstance(self._ex_iterable, _SyntheticTextExamplesIterable):
             self._ex_iterable.iteration_count = epoch
+
+    def is_infinite(self) -> bool:
+        """
+        :return: ``True`` because synthetic text generation does not end
+        """
+        return True
 
 
 @DatasetDeserializerFactory.register("synthetic_text")

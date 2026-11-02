@@ -22,7 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import httpx
+import httpx2
 import pytest
 
 from guidellm.mock_server.server import MockServer
@@ -49,13 +49,13 @@ def _free_port() -> int:
 def _wait_for_server(base_url: str, timeout: float = 30.0) -> None:
     async def _poll() -> None:
         backoff = 0.5
-        async with httpx.AsyncClient() as client:
+        async with httpx2.AsyncClient() as client:
             while True:
                 try:
                     resp = await client.get(f"{base_url}/health", timeout=1.0)
                     if resp.status_code == 200:
                         return
-                except (httpx.RequestError, httpx.TimeoutException):
+                except (httpx2.RequestError, httpx2.TimeoutException):
                     pass
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, 2.0)
@@ -188,8 +188,10 @@ def test_synthetic_image_benchmark_against_mock(mock_backend, tmp_path):
         base_url=mock_backend,
         data=[
             "kind=synthetic_text,prompt_tokens=20",
-            "kind=synthetic_image,width=128,height=128,format=jpeg,"
-            "jpeg_quality=85,output_tokens=8,seed=11",
+            (
+                "kind=synthetic_image,width=128,height=128,format=jpeg,"
+                "jpeg_quality=85,output_tokens=8,seed=11"
+            ),
         ],
         output_dir=tmp_path,
         output_name="image.json",
@@ -213,8 +215,10 @@ def test_synthetic_video_benchmark_against_mock(mock_backend, tmp_path):
         base_url=mock_backend,
         data=[
             "kind=synthetic_text,prompt_tokens=10",
-            "kind=synthetic_video,width=160,height=120,frames=4,fps=1,"
-            "output_tokens=4,seed=23",
+            (
+                "kind=synthetic_video,width=160,height=120,frames=4,fps=1,"
+                "output_tokens=4,seed=23"
+            ),
         ],
         output_dir=tmp_path,
         output_name="video.json",

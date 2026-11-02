@@ -4,11 +4,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     strategy:
       matrix:
-        python: ["3.10"]
+        python: ["3.11"]
     uses: ./.github/workflows/testing.yml
     with:
       python: ${{ matrix.python }}
@@ -16,7 +20,7 @@ jobs:
   quality:
     strategy:
       matrix:
-        python: ["3.10"]
+        python: ["3.11"]
     uses: ./.github/workflows/quality.yml
     with:
       python: ${{ matrix.python }}
