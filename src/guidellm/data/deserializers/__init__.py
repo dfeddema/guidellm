@@ -1,10 +1,12 @@
 from guidellm.data.schemas import InvalidRowError
 
+from .benchmarks import BenchmarkDatasetDeserializer
 from .deserializer import (
     DataNotSupportedError,
     DatasetDeserializer,
     DatasetDeserializerFactory,
 )
+from .speed_bench import SpeedBenchDatasetDeserializer
 from .file import (
     ArrowFileDatasetDeserializer,
     CSVFileDatasetDeserializer,
@@ -51,6 +53,7 @@ from .trace_weka import WEKATraceFormat
 
 __all__ = [
     "ArrowFileDatasetDeserializer",
+    "BenchmarkDatasetDeserializer",
     "CSVFileDatasetDeserializer",
     "DBFileDatasetDeserializer",
     "DataNotSupportedError",
@@ -71,6 +74,7 @@ __all__ = [
     "SyntheticImageDatasetDeserializer",
     "SyntheticTextDataset",
     "SyntheticTextDatasetDeserializer",
+    "SpeedBenchDatasetDeserializer",
     "SyntheticVideoDataset",
     "SyntheticVideoDatasetDeserializer",
     "TarFileDatasetDeserializer",

@@ -1398,6 +1398,7 @@ all = [
     { name = "msgpack" },
     { name = "msgspec" },
     { name = "orjson" },
+    { name = "pandas" },
     { name = "pillow" },
     { name = "tiktoken" },
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version < '3.12' and sys_platform == 'emscripten') or (sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
@@ -1430,6 +1431,10 @@ recommended = [
     { name = "orjson" },
     { name = "tiktoken" },
     { name = "uvloop" },
+]
+speed-bench = [
+    { name = "pandas" },
+    { name = "tiktoken" },
 ]
 tokenizers = [
     { name = "blobfile" },
@@ -1530,7 +1535,7 @@ requires-dist = [
     { name = "eval-type-backport" },
     { name = "faker" },
     { name = "ftfy", specifier = ">=6.0.0" },
-    { name = "guidellm", extras = ["audio", "perf", "plot", "tokenizers", "vision"], marker = "extra == 'all'" },
+    { name = "guidellm", extras = ["audio", "perf", "plot", "speed-bench", "tokenizers", "vision"], marker = "extra == 'all'" },
     { name = "guidellm", extras = ["perf", "tokenizers"], marker = "extra == 'recommended'" },
     { name = "httpx2", extras = ["http2"], specifier = "~=2.13" },
     { name = "imageio", extras = ["ffmpeg"], marker = "extra == 'vision'" },
@@ -1543,6 +1548,7 @@ requires-dist = [
     { name = "msgspec", marker = "extra == 'perf'" },
     { name = "numpy", specifier = ">=2.0.0" },
     { name = "orjson", marker = "extra == 'perf'" },
+    { name = "pandas", marker = "extra == 'speed-bench'" },
     { name = "pillow", marker = "extra == 'vision'" },
     { name = "protobuf" },
     { name = "pydantic", specifier = ">=2.11.7" },
@@ -1551,6 +1557,7 @@ requires-dist = [
     { name = "rich" },
     { name = "sanic" },
     { name = "tabulate" },
+    { name = "tiktoken", marker = "extra == 'speed-bench'" },
     { name = "tiktoken", marker = "extra == 'tokenizers'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'audio'", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cpu" },
@@ -1561,7 +1568,7 @@ requires-dist = [
     { name = "uvloop", marker = "extra == 'perf'" },
     { name = "websockets", specifier = ">=13.0" },
 ]
-provides-extras = ["all", "recommended", "plot", "perf", "tokenizers", "audio", "vision"]
+provides-extras = ["all", "recommended", "plot", "perf", "tokenizers", "speed-bench", "audio", "vision"]
 
 [package.metadata.requires-dev]
 build = [
@@ -5303,7 +5310,7 @@ dependencies = [
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.12' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform == 'win32')" },
-    { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.12' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "setuptools" },
     { name = "sympy" },
     { name = "typing-extensions" },

@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+from guidellm.schemas.data.deserializers.benchmarks import (
+    BENCHMARK_ALIASES,
+    BENCHMARK_PRESETS,
+    BenchmarkDataArgs,
+    BenchmarkPreset,
+    resolve_benchmark_name,
+)
 from guidellm.schemas.data.deserializers.file import DBFileDataArgs, FileDataArgs
 from guidellm.schemas.data.deserializers.huggingface import HuggingFaceDataArgs
+from guidellm.schemas.data.deserializers.speed_bench import (
+    SPEED_BENCH_CONFIGS,
+    SpeedBenchDataArgs,
+)
 from guidellm.schemas.data.deserializers.memory import (
     InMemoryDictDataArgs,
     InMemoryDictListDataArgs,
@@ -28,12 +39,19 @@ from guidellm.schemas.data.deserializers.trace_otel import OTELTraceFormatArgs
 from guidellm.schemas.data.deserializers.trace_weka import WEKATraceFormatArgs
 
 __all__ = [
+    "BENCHMARK_ALIASES",
+    "BENCHMARK_PRESETS",
     "DEFAULT_SYNTHETIC_TOOLS",
     "RESOLUTION_PRESETS",
+    "SPEED_BENCH_CONFIGS",
+    "BenchmarkDataArgs",
+    "BenchmarkPreset",
     "BranchSpec",
     "DBFileDataArgs",
     "FileDataArgs",
     "HuggingFaceDataArgs",
+    "SpeedBenchDataArgs",
+    "resolve_benchmark_name",
     "InMemoryDictDataArgs",
     "InMemoryDictListDataArgs",
     "InMemoryItemListDataArgs",
