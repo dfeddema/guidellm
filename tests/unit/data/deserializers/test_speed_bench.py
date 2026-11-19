@@ -12,7 +12,12 @@ from guidellm.data.deserializers.speed_bench import (
 )
 from guidellm.data.schemas import DataNotSupportedError
 from guidellm.data.schemas.conversation_graph_data import ConversationGraphData
-from guidellm.schemas.data.deserializers.speed_bench import SpeedBenchDataArgs
+from guidellm.schemas.data.deserializers.speed_bench import (
+    SPEED_BENCH_CATEGORIES,
+    SPEED_BENCH_CONFIGS,
+    SpeedBenchDataArgs,
+    categories_for_config,
+)
 
 
 @pytest.fixture
@@ -140,3 +145,52 @@ def test_unknown_config_name_rejected(deserializer):
     """
     with pytest.raises(DataNotSupportedError, match="Valid configs"):
         SpeedBenchDatasetDeserializer._validate_config_name("throughput_4k")
+
+
+@pytest.mark.sanity
+def test_category_enumeration_covers_every_config():
+    """Every published config exposes a non-empty category list.
+
+    ## WRITTEN BY AI ##
+    """
+    assert set(SPEED_BENCH_CATEGORIES) == set(SPEED_BENCH_CONFIGS)
+    assert all(SPEED_BENCH_CATEGORIES[c] for c in SPEED_BENCH_CONFIGS)
+    assert "coding" in categories_for_config("qualitative")
+    assert categories_for_config("throughput_1k") == (
+        "low_entropy",
+        "mixed",
+        "high_entropy",
+    )
+    assert categories_for_config("unknown_config") == ()
+
+
+@pytest.mark.smoke
+def test_unknown_category_rejected_before_resolve():
+    """A category not in the split is rejected early, listing valid categories.
+
+    ## WRITTEN BY AI ##
+    """
+    with pytest.raises(DataNotSupportedError, match="Valid categories"):
+        SpeedBenchDatasetDeserializer._validate_category("qualitative", "nope")
+
+
+@pytest.mark.sanity
+@pytest.mark.parametrize(
+    ("config", "category"),
+    [("qualitative", "coding"), ("throughput_1k", "mixed")],
+)
+def test_valid_category_passes_early_validation(config, category):
+    """A category that exists in the split passes early validation (no raise).
+
+    ## WRITTEN BY AI ##
+    """
+    SpeedBenchDatasetDeserializer._validate_category(config, category)
+
+
+@pytest.mark.sanity
+def test_no_category_skips_validation():
+    """Omitting the category is always valid (full-split run).
+
+    ## WRITTEN BY AI ##
+    """
+    SpeedBenchDatasetDeserializer._validate_category("qualitative", None)

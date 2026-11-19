@@ -26,6 +26,7 @@ from guidellm.data.deserializers.deserializer import (
 from guidellm.schemas.data.deserializers.speed_bench import (
     SPEED_BENCH_CONFIGS,
     SpeedBenchDataArgs,
+    categories_for_config,
 )
 
 __all__ = ["SpeedBenchDatasetDeserializer"]
@@ -96,6 +97,10 @@ class SpeedBenchDatasetDeserializer(DatasetDeserializer):
             self._reject_unresolved(str(config.source), rows)
         else:
             self._validate_config_name(config.config)
+            # Validate the category against the split BEFORE the (expensive,
+            # multi-GB) resolve, so a typo fails in a second with the valid list
+            # rather than after a long download.
+            self._validate_category(config.config, config.category)
             cache_path = self.cache_path_for(config.config)
             if not cache_path.exists():
                 cache_path = self.resolve_config(
@@ -136,11 +141,15 @@ class SpeedBenchDatasetDeserializer(DatasetDeserializer):
                 single.append(turns[0])
 
         if config.category and not single and not multi:
+            known = categories_for_config(config.config)
+            hint = (
+                f" Valid categories for this split: {', '.join(known)}."
+                if known
+                else ""
+            )
             raise DataNotSupportedError(
                 f"SPEED-Bench category {config.category!r} matched none of the "
-                f"{total} rows in config {config.config!r}. Verify the category "
-                f"exists in this split -- the qualitative and throughput splits "
-                f"have different category names."
+                f"{total} rows in config {config.config!r}.{hint}"
             )
 
         source_name = f"speed_bench:{config.config}"
@@ -247,6 +256,24 @@ class SpeedBenchDatasetDeserializer(DatasetDeserializer):
             raise DataNotSupportedError(
                 f"Unknown SPEED-Bench config {config!r}. Valid configs: "
                 f"{', '.join(SPEED_BENCH_CONFIGS)}."
+            )
+
+    @staticmethod
+    def _validate_category(config: str, category: str | None) -> None:
+        """Reject an unknown category before the expensive resolve.
+
+        The qualitative and throughput splits have different category names, so
+        a category valid for one split is a typo for another. Checking here
+        turns a wasted multi-GB download into an immediate, actionable error.
+        """
+        if not category:
+            return
+        known = categories_for_config(config)
+        if known and category not in known:
+            raise DataNotSupportedError(
+                f"Unknown SPEED-Bench category {category!r} for config "
+                f"{config!r}. Valid categories for this split: "
+                f"{', '.join(known)}."
             )
 
     @classmethod

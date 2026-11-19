@@ -7,8 +7,10 @@ from pydantic import AliasChoices, ConfigDict, Field
 from guidellm.schemas.data.entrypoints import DataArgs
 
 __all__ = [
+    "SPEED_BENCH_CATEGORIES",
     "SPEED_BENCH_CONFIGS",
     "SpeedBenchDataArgs",
+    "categories_for_config",
 ]
 
 # The seven configs the resolver and nvidia/SPEED-Bench publish.
@@ -21,6 +23,44 @@ SPEED_BENCH_CONFIGS: tuple[str, ...] = (
     "throughput_32k",
     "throughput_100k",
 )
+
+# Categories available within each config, mirroring the splits AIPerf exposes.
+# The qualitative split carries semantic-domain categories; every throughput
+# split carries the same three entropy tiers. Used to validate ``category=``
+# before the (expensive) resolve and to drive the per-category sweep helper
+# in ``contrib/speed_bench_per_category.py``.
+_QUALITATIVE_CATEGORIES: tuple[str, ...] = (
+    "coding",
+    "humanities",
+    "math",
+    "multilingual",
+    "qa",
+    "rag",
+    "reasoning",
+    "roleplay",
+    "stem",
+    "summarization",
+    "writing",
+)
+_THROUGHPUT_CATEGORIES: tuple[str, ...] = (
+    "low_entropy",
+    "mixed",
+    "high_entropy",
+)
+SPEED_BENCH_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "qualitative": _QUALITATIVE_CATEGORIES,
+    "throughput_1k": _THROUGHPUT_CATEGORIES,
+    "throughput_2k": _THROUGHPUT_CATEGORIES,
+    "throughput_8k": _THROUGHPUT_CATEGORIES,
+    "throughput_16k": _THROUGHPUT_CATEGORIES,
+    "throughput_32k": _THROUGHPUT_CATEGORIES,
+    "throughput_100k": _THROUGHPUT_CATEGORIES,
+}
+
+
+def categories_for_config(config: str) -> tuple[str, ...]:
+    """Return the known categories for a SPEED-Bench config (empty if unknown)."""
+    return SPEED_BENCH_CATEGORIES.get(config, ())
 
 
 @DataArgs.register(["speed_bench", "speedbench", "speed-bench"])
